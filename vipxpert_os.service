@@ -1,0 +1,24 @@
+# /vipxpert_minimal_os/vipxpert_os.service
+[Unit]
+Description=VipXpert Minimal OS Engine
+After=network.target multi-user.target
+
+[Service]
+Type=simple
+User=vipxpert
+Group=gpio
+WorkingDirectory=/home/vipxpert/vipxpert_minimal_os
+# Target the Python binary directly inside your virtual environment
+ExecStart=/home/vipxpert/vipxpert_minimal_os/venv/bin/python3 main.py
+
+# Auto-recovery: If the app crashes due to an unhandled hardware fault, restart it
+Restart=on-failure
+RestartSec=3
+
+# Standardize log outputs to the system journal
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=vipxpert-os
+
+[Install]
+WantedBy=multi-user.target

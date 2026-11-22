@@ -1,0 +1,104 @@
+# /vipxpert_minimal_os/.gitignore
+# Vipxpert Zero OS — Git Ignore Manifest
+
+# --- 1. Live OS Database, Hardware Calibrations & Device State (NEVER COMMIT) ---
+# Protects user-calibrated oled_pwm_dt, paired Bluetooth MACs, and local settings
+vipxpert_os.db
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+codec_cache.txt
+
+# --- 2. Python Virtual Environments & Bytecode ---
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# --- 3. Rust & C/C++ Compiled Artifacts (Rebuilt by install.py) ---
+rust_workers/target/
+/bin/*
+!/bin/.gitkeep
+/libldacdec/
+*.o
+*.so
+*.a
+*.out
+*.dtbo
+
+# --- 4. Local Harness Clone & Editor / IDE State ---
+# Note: /.llm_harness/ project memory is managed by harness.py itself; /llm_harness/ is a local tool clone
+/llm_harness/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- 5. User Media, Offline Music, MV Video Caches & Synthesized WAVs ---
+/music/*
+!/music/.gitkeep
+/sounds/*.wav
+mv_cache/
+cache/
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.aac
+*.opus
+*.wav
+*.m3u
+*.mp4
+*.mkv
+*.webm
+*.pcm
+*.raw
+*.bin
+
+# --- 6. Local Scratch Notes, One-Off Bench Scripts, Backups & Stray Redirects ---
+*.bak
+*.orig
+*.log
+*.png
+*.jpg
+/brcm_patchram_plus.c*
+/diag_pwm.py
+/ir_analyzer*.py
+/ir_geiger.py
+/ir_tap.py
+/ir_timeline.py
+/test_keypad.py
+/test_power.py
+/test_screen.py
+/true_idle_test.py
+/ups_test.py
+/tests/
+/docs/ye.txt
+/docs/ye copy.txt
+/0
+/0x00
+/0x20
+/100Hz
+/12.0
+/\[dt=*
+
+# --- 7. Future Secrets, Credentials & OTA / Network Keys (Keep Appended) ---
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*secret*
+wpa_supplicant*.conf
+hostapd*.conf

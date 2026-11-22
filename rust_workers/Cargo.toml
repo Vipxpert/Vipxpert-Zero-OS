@@ -1,0 +1,20 @@
+# /vipxpert_minimal_os/rust_workers/Cargo.toml
+[package]
+name = "vipxpert_rust_workers"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "viz_dsp"
+path = "src/bin/viz_dsp.rs"
+
+[[bin]]
+name = "mic_scope_dsp"
+path = "src/bin/mic_scope_dsp.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

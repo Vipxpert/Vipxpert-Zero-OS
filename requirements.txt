@@ -1,0 +1,16 @@
+Adafruit-PureIO==1.1.11
+Adafruit_GPIO==1.0.3
+cbor2==6.1.4
+dbus-next==0.2.3
+evdev==2.0.0
+gpiod==2.5.0
+luma.core==2.6.0
+luma.oled==3.15.0
+mock==5.2.0
+pi-ina219==1.4.1
+pillow==12.3.0
+psutil==7.2.2
+pydbus==0.6.0
+pyudev==0.24.4
+smbus2==0.6.1
+spidev==3.8

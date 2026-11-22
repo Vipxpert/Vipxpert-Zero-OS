@@ -1,0 +1,8 @@
+{
+  "rules": [
+    {
+      "pattern": "bad\\s*apple",
+      "video": "bad_apple.mp4"
+    }
+  ]
+}
