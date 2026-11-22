@@ -1,0 +1,30 @@
+# /vipxpert_minimal_os/docs/debug/bug_display_bt_subtle_hiccup.txt
+# Stage: Symptom & Target Invariant
+After eliminating the 130ms/1.77s PowerMonitor I2C_BUS_LOCK stall (CDR-487) and 1-1-1-2 marquee pulldown (CDR-488), a subtle simultaneous hiccup remains in both OLED Visualizer/marquee rendering and Bluetooth audio playback. Target invariant: Core 1 isolated strictly to OLED_Compositor, zero periodic PipeWire graph-locking subprocess forks during steady playback, zero >25ms SHM latch slips, and zero PipeWire audio xruns.
+
+# Stage: Functionality & Prerequisite Checklist
+- [PASS] PowerMonitor single-attempt <1.5ms I2C_BUS_LOCK hold & backoff (CDR-487)
+- [PASS] Integer 1px/latch V-Sync marquee stepper in Display.clear (CDR-488)
+- [FAIL - SEEN IN CODE] LockScreenApp._viz_scope_worker pins Python Goertzel + pw-record onto Core 1 (`taskset -c 0,1`, lock_app.py:800), colliding with nice(-20) OLED_Compositor on Core 1
+- [FAIL - SEEN IN CODE] OSKernel.apply_rt_cpu_state pins PipeWire main-loop control thread onto `0-2` (includes Core 1, os_kernel.py:825), letting nice(-20) OLED_Compositor starve PipeWire socket/A2DP control on Core 1
+- [PASS -> PATCHED IN CDR-496] DP-495 live AFF proved `pipewire` (PID 1281) had `Cpus_allowed_list: 0-2` (including Core 1!) and `_viz_scope_worker` spawned `taskset -c 0,1` (putting child `parec` on Core 1 with 16ms < 1024q latency); patched to `0,2` and `0` (`--latency-msec=22`)
+- [PASS -> PATCHED IN CDR-501] P-500 proved `_wifi_policy_daemon` pinned `.vscode-server`/`sshd` (79.7% CPU) onto RT Audio Core 3 alongside `SCHED_FIFO 88` `data-loop.0`, `main.py` leaked threads onto Core 1 & burned 69.8% on BT-USB Core 2, `_viz_scope_worker` ran 125Hz Goertzel (70.6% CPU), and `adb_audio_bridge` forked `adb` every 1.5s with no phone attached; isolated all four in CDR-501
+
+# Stage: Eliminated Approaches & Touched Scopes
+- [CDR-487] | /src/hardware/power_monitor.py (PowerMonitor._hardware_monitor_loop) | 6x in-lock retry caused 130ms I2C_BUS_LOCK stall every 1.77s | Fixed major 130ms screen stutter; subtle simultaneous display + BT audio hiccup remains
+- [CDR-488] | /src/hardware/display.py (Display.clear) + /src/apps/lock_app.py (_draw_spectrum_bars) | Fractional 1-1-1-2 marquee step and 120Hz bar beat-aliasing | Eliminated telecine pulldown, exposed underlying simultaneous system/audio hiccup
+- [CDR-496] | /src/core/os_kernel.py (apply_rt_cpu_state) + /src/apps/lock_app.py (_viz_scope_worker) | Evict pipewire main-loop (`0,2`) and parec (`0`) off Core 1 | Tested in HR-503
+- [CDR-502 / HR-503] | /src/core/os_kernel.py + /src/apps/lock_app.py | Cramming main.py (54.5% at oled_fps=120) + _viz_scope_worker (38.9%) + pipewire + wireplumber + sshd/.vscode-server all onto single Core {0} | REGRESSION: Saturated Core 0 (>100% CPU), making UI/audio laggy & choppy, AND revealed 51.4ms & 70.0ms `MQ` stalls (`mq_spikes=[('M', 3.051, 51.4), ('M', 4.425, 70.0)]`). Never cram main.py + viz + vscode all onto single Core {0}!
+
+- [CDR-509] | /src/core/viz_dsp.c + /src/core/os_kernel.py + /src/hardware/display.py | Replaced 39..71% CPU Python Goertzel with native C99 `bin/viz_dsp` (<0.5% CPU), replaced `_main_loop` 150us (6.6kHz, 55% CPU) busy-spin with exact deadline sleep + 51.73Hz UI PWM cadence match, un-crammed `main.py` onto `{0,2}` (`performance` gov), and added `delta_hw` marquee catch-up | Testing live CPU% and 5s pacing now
+
+- [PASS - MAJOR IMPROVEMENT IN CDR-512] `viz_dsp` dropped Goertzel CPU from 70.6% -> 0.7%, `mq_med` locked to 19.36ms, user confirmed "Much better but not perfect" — one 87.7ms spike remained (`[('M', 4.159, 87.7)]`) and two `main.py` threads (`17818`, `17820`) still showed `PSR=1`
+
+- [PROVEN IN DHP-513 -> PATCHED IN CDR-514] `HW_BIG_DT: []` proved Core-1 `OLED_Compositor` had 0 hardware stalls, while `10S_SPIKES` caught 15 `V` (`shm_ver`) misses of 29..42ms (`composite_frame` only 5.3ms!) because `_main_loop`'s free-running 8.33ms timer raced `pwm_phase==2` (`19.33ms`), missing latches by ~2ms and holding marquee pixels for 2 PWM cycles (38.7ms); AND `dmesg` caught `0x43 -> 0x3c` Ctlr Error every 60.17s causing the 87.7ms spike. Locked `_main_loop` directly to `shm[20:24]` `hw_tick` edge and parked offline `0x43` after 3 NACKs in CDR-514.
+
+- [PROVEN IN P-515 -> PATCHED IN CDHR-516] `P-515` revealed `main.py` unconditionally ran `tracemalloc.start(25)` (burning 48.3% CPU and freezing the GIL for `839.4ms` on `take_snapshot()` at 30s/60s!) AND `_autopsy_cpu_sampler_thread` calling `sys._current_frames()` at `50Hz` (`TID 18244`, seizing the GIL every 20ms and causing `39.62ms` `VIZ_GT22` double-holds). Gated both behind `VIPXPERT_AUTOPSY_PROFILE=1` in CDHR-516.
+
+- [PASS - RESOLVED IN CDHR-516] 10.0s 3.3kHz benchmark verified `mq_cnt=516`, `med=19.353ms` (within `2.8us` of theoretical `3 * 6.451948ms = 19.3558ms`), `std_dev=1.593ms`, `max=29.014ms` (eliminating all 87ms..839ms freezes), and `viz_dsp` at `0.8%` CPU / `1.7MB` RSS. Status: RESOLVED (full Pure-Rust compositor/OS migration tracked in Option 2 roadmap).
+
+# Stage: Isolation & Telemetry Plan
+RESOLVED — retain native C/Rust DSP worker, Core-1/Core-3 isolation, `hw_tick`-locked `_main_loop`, and 3-strike `0x43` park invariants.

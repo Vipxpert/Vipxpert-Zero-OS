@@ -1,0 +1,18 @@
+# /vipxpert_minimal_os/docs/trees/tree_app_music_offline.txt
+/vipxpert_minimal_os
+├── vipxpert_os.service (Systemd configuration for automatic boot execution and persistence)
+    └── /src
+        └── /apps
+            ├── music_app.py (Headless router for Local Audio playback handling Instant Play, Playlists, and Stateful Sessions)
+                └── -> OfflineMusicApp (Front-end interface enforcing strict /music/ directory isolation and the 2-Step Workflow)
+                    ├── on_start() / on_stop() (Manages the lifecycle of the immortal background tracker task to prevent zombies)
+                    ├── update() (Smart Wake hook that instantly re-routes to the root menu if pulled from the OS background cache)
+                    ├── _ghost_tracker_loop() (Detached background task that writes playhead progress to SQLite every 5s while local audio is playing and backs off to 15s idle sleep when paused/stopped)
+                    ├── _mount_root_menu() / _open_scene_viewer() (Routes to Instant Play, Playlists, Sessions, or launches the live Music Visualizer / Scene Cartridge viewer directly in-app)
+                    ├── _mount_instant_play() / _mount_playlists() (Scans the local directory for multi-format audio files (.mp3, .flac, .wav, .ogg, .m4a, .aac, .opus) or M3U map files, marks the active track with a `► ` indicator, and builds tracked execution paths)
+                    ├── _mount_sessions() (Mounts a CrudListApp fetching persistent tape states and explicitly pins the dynamic Ghost Session to the top)
+                    ├── _prompt_session_action() (The 2-Step Workflow executing Resume vs. Overwrite collision logic)
+                    ├── _play_raw() / _play_shuffle() (Generates physical temporary mixtape M3U files in the permanent user directory for reliable state tracking)
+                    ├── _send_playlist_sequence() (Bulletproof asynchronous helper sequentially coordinating track swaps and time-seeks to prevent loading race conditions)
+                    ├── _play_session() / _overwrite_session() (Audio execution and live session state persistence routines updating the Arbiter, SQLite database, and MPV states)
+                    └── _db_*_session() (Local helpers bridging app logic to the DatabaseManager, including copying physical tape files on Save-As/Overwrite actions and renaming saved sessions)

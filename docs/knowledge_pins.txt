@@ -1,0 +1,844 @@
+================================================================================
+BANANA PI M4 ZERO (REV 2) / ALLWINNER H616/H618
+ADVANCED GPIO & HARDWARE MAPPING GUIDE
+================================================================================
+
+1. THE DOCUMENTATION REALITY
+--------------------------------------------------------------------------------
+Board manufacturers frequently alter physical trace routings between hardware 
+revisions (e.g., Rev 1 vs Rev 2) to optimize manufacturing or fix electrical 
+noise. Generic PDF manuals and online pinout diagrams are often outdated and 
+unreliable for specific board revisions. 
+
+Rule of Thumb: The only absolute source of truth is the live Linux kernel. 
+If software acts correctly but the hardware fails, the physical pin trace 
+does not match the documentation.
+
+2. PIN BEHAVIORS & STATES
+--------------------------------------------------------------------------------
+Pins on this architecture fall into three behavioral categories:
+
+A. Locked / Claimed Pins (Kernel Blocked)
+- Reserved by the CPU's internal controllers (e.g., SDIO/MMC, SPI, UART, AHUB).
+- Attempting to manipulate these via user-space tools (`gpioset`, `libgpiod`) 
+  or custom device trees will result in an "Invalid argument" (Errno 22 / 
+  -EINVAL) kernel crash.
+- Even if a pin is physically exposed on the 40-pin header, the CPU will 
+  refuse to yield it to user-space if `pinctrl` has it claimed by a driver.
+
+B. Hardware Pull-Up Pins (Constant HIGH)
+- Certain physical pins (e.g., Physical Pins 22, 28, and 36 on this board) 
+  are wired with physical pull-up resistors on the PCB.
+- They default to a constant 3.3V state. 
+- These are unsuitable for standard data outputs or precise logic signaling 
+  because they naturally rest in a HIGH state and resist being pulled LOW.
+
+C. Unclaimed / Free Pins
+- Completely isolated from internal CPU buses.
+- Mathematically guaranteed to accept Device Tree overlays or raw `gpioset` 
+  manipulation without kernel rejection.
+
+3. FORMULAIC GUIDE: EXTRACTING THE HARDWARE TRUTH
+--------------------------------------------------------------------------------
+When deploying a new peripheral, follow this specific order of operations to 
+guarantee software-to-hardware alignment.
+
+STEP 1: Dump the Live Device Tree (The Brain)
+Extract the exact hardware map the manufacturer compiled for your board revision:
+$ dtc -I fs -O dts /sys/firmware/devicetree/base > live_hardware_map.dts
+
+STEP 2: Verify Subsystem Assignments & Pinmux Functions
+Search the dumped map and the kernel's pinctrl debugfs to see which exact 
+sub-function strings the driver expects (Allwinner splits clock and data 
+functions into separate groups):
+$ sudo grep -i "i2s" /sys/kernel/debug/pinctrl/300b000.pinctrl/pinmux-functions
+
+STEP 3: Check for Kernel Locks (`pinctrl`)
+Before attempting to use a GPIO pin, verify it is completely free in the 
+CPU's memory controller:
+$ sudo cat /sys/kernel/debug/pinctrl/300b000.pinctrl/pinmux-pins | grep 'UNCLAIMED'
+
+STEP 4: Hardware Sweeping (The Brute-Force Pin Finder)
+If a documented pad (e.g., PI9) is UNCLAIMED but the documented physical pin 
+is dead, the trace was moved. Use `gpioset` to strobe the software pad, and 
+use an LED/multimeter to probe physical pins until a signal is found.
+
+1. Find the GPIO chip:
+$CHIP=$(gpiodetect | grep '300b000' | awk '{print $1}')
+
+2. Strobe a specific software line (e.g., Line 266):
+$ while true; do gpioset $CHIP 266=1; sleep 0.1; gpioset$CHIP 266=0; sleep 0.1; done
+
+3. Physically tap the jumper wire across open header pins until the signal 
+   registers on the multimeter/LED.
+
+4. KNOWN HARDWARE TRUTHS (M4 ZERO REV 2)
+--------------------------------------------------------------------------------
+- Hardware Pull-ups (Do not use for standard logic output): 
+  Physical Pins 22, 28, 36.
+
+- Altered IR Trace: 
+  CPU Pad PI9 (Bank I, Pin 9 / GPIO 265) physically terminates at Header 
+  Pin 31, NOT Header Pin 12 as generic manuals suggest.
+
+- Keypad Matrix Pads (PH Bank & PI12):
+  The PH bank pads PH2, PH3, PH5, PH6, PH7, PH8, and PH9 (GPIO 226, 227, 229, 
+  230, 231, 232, 233) along with PI12 (GPIO 268 on Pin 7) physically route to 
+  the general GPIO header pins used by the matrix keypad (Pins 11, 13, 19, 21, 
+  23, 24, 26). 
+  WARNING: Do NOT enable `i2s3` (`i2s3-pins`), as it claims PH5-PH7 and causes 
+  an immediate `libgpiod` Errno 22 crash on the keypad subsystem.
+
+- I2S / Digital Audio (PI Bank -> Standard I2S Header Pins 12, 35, 38, 40): 
+  Physical Pins 12, 35, 38, and 40 are wired to Bank I (`PI1-PI4`) on the 
+  `i2s0` (`ahub0_plat`) hardware controller, NOT `i2s3` (`PH5-PH9`):
+  * Header Pin 12 (BCLK) -> Pad PI1 (GPIO 257) | function = "i2s0"
+  * Header Pin 35 (LRCK) -> Pad PI2 (GPIO 258) | function = "i2s0"
+  * Header Pin 40 (DOUT) -> Pad PI3 (GPIO 259) | function = "i2s0_dout0"
+  * Header Pin 38 (DIN)  -> Pad PI4 (GPIO 260) | function = "i2s0_din0"
+
+- Allwinner H618 AHUB Driver Nuances:
+  1. Split Pinmux Functions: The `sun50i-h616-pinctrl` driver rejects generic 
+     `function = "i2s0"` on data pins. Clocks (`PI1`, `PI2`) must use `"i2s0"`, 
+     while Data Out (`PI3`) requires `"i2s0_dout0"` and Data In (`PI4`) 
+     requires `"i2s0_din0"`.
+  2. Pinctrl Binding Target: The platform driver (`allwinner,sunxi-snd-plat-ahub`, 
+     e.g., `ahub0_plat`) is the node that requests hardware pins from the 
+     kernel. `pinctrl-0` must be attached directly to `ahub0_plat` (with 
+     `tdm_num = <0x00>`, `apb_num = <0x00>`, and `dmas = <0x1c 0x03 0x1c 0x03>`), 
+     otherwise `PI1-PI4` remain `UNCLAIMED` and silent.
+
+5. DEVICE TREE OVERLAY TEMPLATES
+--------------------------------------------------------------------------------
+A. Generic GPIO Peripheral Template:
+
+/dts-v1/;
+/plugin/;
+/ {
+    compatible = "allwinner,sun50i-h618", "allwinner,sun50i-h616";
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            custom_device_name {
+                compatible = "driver-name-here";
+                /* <&pio BANK PIN 0> */
+                /* A=0, B=1, C=2, D=3, E=4, F=5, G=6, H=7, I=8 */
+                gpios = <&pio 8 9 0>; /* Example: Bank I (8), Pad 9 */
+            };
+        };
+    };
+};
+
+B. Verified Full-Duplex I2S0 Audio Hub Template (PI1-PI4):
+
+/dts-v1/;
+/plugin/;
+/ {
+    compatible = "allwinner,sun50i-h618", "allwinner,sun50i-h616";
+
+    fragment@0 {
+        target-path = "/soc/pinctrl@300b000";
+        __overlay__ {
+            i2s0_clk_pins: i2s0-clk-pins {
+                pins = "PI1", "PI2";
+                function = "i2s0";
+            };
+            i2s0_dout_pin: i2s0-dout-pin {
+                pins = "PI3";
+                function = "i2s0_dout0";
+            };
+            i2s0_din_pin: i2s0-din-pin {
+                pins = "PI4";
+                function = "i2s0_din0";
+            };
+        };
+    };
+
+    fragment@1 {
+        target-path = "/soc";
+        __overlay__ {
+            ahub0_plat: ahub0_plat {
+                #sound-dai-cells = <0x00>;
+                compatible = "allwinner,sunxi-snd-plat-ahub";
+                apb_num = <0x00>;
+                dmas = <0x1c 0x03 0x1c 0x03>;
+                dma-names = "tx", "rx";
+                playback_cma = <0x80>;
+                capture_cma = <0x80>;
+                tx_fifo_size = <0x80>;
+                rx_fifo_size = <0x80>;
+                tdm_num = <0x00>;
+                tx_pin = <0x00>;
+                rx_pin = <0x00>;
+                pinctrl-names = "default";
+                pinctrl-0 = <&i2s0_clk_pins &i2s0_dout_pin &i2s0_din_pin>;
+                status = "okay";
+            };
+
+            ahub0_mach: ahub0_mach {
+                compatible = "allwinner,sunxi-snd-mach";
+                soundcard-mach,name = "ahubi2s0";
+                soundcard-mach,format = "i2s";
+                soundcard-mach,frame-master = <&ahub0_cpu>;
+                soundcard-mach,bitclock-master = <&ahub0_cpu>;
+                soundcard-mach,slot-num = <0x02>;
+                soundcard-mach,slot-width = <0x20>;
+                status = "okay";
+
+                ahub0_cpu: soundcard-mach,cpu {
+                    sound-dai = <&ahub0_plat>;
+                    soundcard-mach,pll-fs = <0x04>;
+                    soundcard-mach,mclk-fs = <0x00>;
+                };
+
+                ahub0_codec: soundcard-mach,codec {
+                };
+            };
+        };
+    };
+};
+================================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+(Note: Also keep an eye on conflicting_overlays = {'bananapi-m4-pi-5-6-i2c0', 'i2c3-ph'} inside step_armbian_env()—if your OLED on I2C bus 0 relies on bananapi-m4-pi-5-6-i2c0 in /boot/armbianEnv.txt, you may want to remove 'bananapi-m4-pi-5-6-i2c0' from conflicting_overlays so running Step 5 doesn't strip I2C0 from your boot config.)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+================================================================================
+VIPXPERT MINIMAL OS - ALLWINNER H618 GPIO, I2S AUDIO, USB PHY & RT DOCUMENTATION
+Board: Banana Pi M4 Zero (Allwinner H618 / sun50i-h616)
+Peripherals: PCM5122 I2S DAC, 2x ICS-43434 I2S Mics, MAX97220 Amp, IR TX/RX,
+             Terminus 1a40:0101 USB 2.0 Hub, TP-Link UB500 (2357:0604) BT
+================================================================================
+
+1. OVERVIEW OF THE 5 HARDWARE SIGNAL INTEGRITY ISSUES & ROOT-CAUSE FIXES
+--------------------------------------------------------------------------------
+
+ISSUE A: Loud "RRRRR" 50/60Hz Full-Scale Buzz When Touching DIN Wire (At Rest)
+* Affected Pin: Physical Pin 40 (Pad PI3 - I2S0 DOUT / DAC DIN)
+* Symptom: When audio playback stopped and PipeWire/ALSA closed the I2S device
+  after 5 seconds, touching the plastic insulation of the Pin 40 jumper wire
+  caused a loud full-scale 50/60Hz square-wave buzz from the DAC.
+* Root Cause:
+  1. When ALSA closes the I2S interface, the Allwinner H618 disconnects its
+     push-pull CMOS output driver and leaves PI3 in a high-impedance (Hi-Z /
+     floating) state.
+  2. The Adafruit PCM5122 breakout does not have a physical pull-down resistor
+     on the DIN pin.
+  3. Capacitive coupling through the wire's plastic jacket injected 50/60Hz body
+     hum onto the floating copper wire, swinging it past the 1.65V digital logic
+     threshold.
+* Permanent Fix:
+  - Enabled the Allwinner H618 internal silicon Pull-Down resistor (~50kOhm to
+    0V Ground) on PI1-PI4 via /dev/mem (Register PI_PULL0 @ 0x0300B13C, bits
+    [9:2] = 0x2A8) and Device Tree (`bias-pull-down;`).
+  - Result: Clamps DIN to 0.0V the microsecond ALSA closes. Eliminates buzz at
+    0.0 mW idle power while allowing WirePlumber to sleep the DAC after 5s.
+
+ISSUE B: Right-Channel "Popcorn" Popping When Touching BCK Wire (During Music)
+* Affected Pin: Physical Pin 12 (Pad PI1 - I2S0 BCLK)
+* Symptom: While music was actively playing, touching the plastic insulation of
+  the Pin 12 BCK wire caused violent popcorn popping on the Right audio channel.
+* Root Cause:
+  1. Pin 12 drives a 3-way split jumper wire (PCM5122 DAC + Mic 1 + Mic 2) at
+     3.072 MHz (48kHz stereo).
+  2. At the default Device Tree drive strength of Level 1 (20mA, PI_DRV0 =
+     0x55555555), the output impedance (~150 Ohm) combined with the 3-way wire
+     reflection and finger capacitance (~20 pF) created a non-monotonic voltage
+     shelf right at the 1.65V logic threshold.
+  3. The DAC saw double clock ticks on the rising edge, shifting the last 32
+     bits of the 64-bit I2S frame (the Right audio channel) and corrupting the
+     PCM5122's BCK-driven PLL lock.
+- Permanent Fix:
+  - Elevated Port I pad drive strength from Level 1 (20mA) to Level 2 (30mA,
+    default) on PI1-PI2 (BCK/WSEL) via /dev/mem (Register PI_DRV0 @ 0x0300B134)
+    and Device Tree (`drive-strength = <30>;` on PI1-PI2, `<10>` on PI3-PI4),
+    passing the finger-touch capacitance test on the 3-way split without 40mA
+    overshoot, while remaining live-configurable via the OLED UI (`I2S Drive`:
+    10mA L0 / 20mA L1 / 30mA L2 / 40mA L3).
+
+ISSUE C: PCM5122 Silence in 3-Wire I2S Mode (Missing Master Clock / MCK)
+* Affected Pins: Pin 3 (I2C0 SDA), Pin 5 (I2C0 SCL), Pin 12 (BCK)
+* Symptom: Complete silence when using a 3-wire I2S hookup (BCK, WSEL, DIN)
+  without an external Master Clock (MCK) wire.
+* Root Cause: By default, the PCM5122 waits for an external system clock on its
+  MCK pin and halts internal interpolation if MCK is missing.
+* Permanent Fix:
+  - Bridged MOD2 to VIN (3.3V) on the PCM5122 to latch I2C mode at address 0x4c.
+  - Programmed Page 0 I2C registers on boot:
+    * Reg 0x02 = 0x00 (Ensure normal active mode / exit standby)
+    * Reg 0x0d = 0x10 (Set PLL clock reference to BCK on Pin 12)
+    * Reg 0x14..0x1B = 98.304MHz 3-wire BCK PLL recipe (P=1, J=16, D=0, R=2,
+      DSP=/2) pre-loaded prior to asserting Reg 0x25 = 0x0A, automatically
+      pulsing standby + powerdown (Reg 0x02 = 0x11 -> 0x00) whenever the ROM
+      program or divider tuples change so ROM topologies and manual clock
+      dividers latch live into Reg 0x2B & Reg 0x66..0x68 without crunching.
+      (Note: 98.304MHz is the exact synchronous binary power-of-2 VCO ceiling
+      at 48kHz [2048 x fs]; overclocking the PLL to 1.25x [122.88MHz] violates
+      the 50MHz miniDSP timing closure and distorts, while 1.5x [147.45MHz] and
+      2.0x [196.60MHz] exceed the CMOS ring-oscillator lock range and mute.)
+    * Reg 0x1C = 0x00 (DAC Clock Divider: `-1` DB sentinel for Auto `/16` ⚙,
+      `0` = `Div /1 ★` [0x00, full 98.304MHz PLL rate / 16x overclock over
+      factory 6.144MHz] default, `/2` [49.152MHz], `/4`, `/8`, `/16`, and `/32`.
+      Hardware finding: Higher DAC clock dividers like `/32` [3.072MHz] do NOT
+      reduce board EMI; instead, starving the interpolation clock degrades time
+      resolution and folds ultrasonic quantization noise into the audible band
+      as a gritty, metallic sheen. Running `Div /1` [98.304MHz] or `Div /2`
+      [49.152MHz] yields the cleanest, highest-resolution reconstruction.)
+    * Reg 0x1D = 0x7F (Negative Charge-Pump Clock Divider: `-1` DB sentinel for
+      Auto `/4` ⚙, `/20` [4.915MHz], `/24`, `/28`, `/32`, `/48`, `/64`
+      [1.536MHz TI nominal], `/96`, and `/128 ★` [768kHz Ultra Low-EMI default,
+      max 7-bit register count]. Hardware boundary: Dividers `/18` [5.46MHz]
+      and faster exceed the 2.2uF flying capacitor's ~4MHz self-resonant
+      frequency and 50ns H-bridge dead-time, collapsing VNEG and triggering
+      UVLO mute.)
+    * Reg 0x1E = 0x7F (Modulator / OSR Clock Divider: `-1` DB sentinel for Auto
+      `/8` ⚙, `/2` [49.152MHz], `/3`, `/4`, `/6`, `/8`, `/12`, `/16`, `/24`,
+      `/32`, `/48`, `/64`, `/80`, `/96`, `/112`, and `/128 ★` [768kHz / 16x OSR
+      default, max 7-bit register count].
+      Hardware Cross-Domain Matrix Findings [f_DAC vs. f_MOD]:
+      1. `MOD = Div /1` [98.304MHz] exceeds the ~10ns switched-capacitor
+         settling limit and mutes.
+      2. Cumulative Starvation Trap [`DAC = /32` + `MOD = /128`]: Running both
+         clocks at their slowest extremes [3.072MHz DAC feeding 768kHz MOD at a
+         4:1 ratio] causes severe audible aliasing/metallic crunch, whereas
+         `DAC = /32` + `MOD = /64` [1.536MHz, 2:1 ratio] plays cleanly.
+      3. Synchronous Race & Under-Fed Modulator [`DAC = /32` + `MOD <= /32`]:
+         When `f_DAC == f_MOD` [`/32` & `/32`, 1:1] or `f_DAC < f_MOD` [e.g.
+         `DAC = /32` with `MOD = /8` or `/2`], the analog switches re-sample
+         stale digital noise-shaper latches, Slightly degrading texture.
+      4. Optimal Reference [`DAC = Div /1 ★` 98.304MHz + `MOD = Div /128 ★`
+         768kHz + `NCP = Div /128 ★` 768kHz]: Feeds the 768kHz switched-
+         capacitor modulator from the 98.304MHz digital noise-shaper at a clean
+         128:1 ratio, combining maximum digital precision with maximum 1.30us
+         analog capacitor settling time and minimum charge-pump EMI.)
+    * Reg 0x2B = 0x01..0x07 (ROM Oversampling Program: 1=8x Fast ★, 2=8x Slow,
+      3=4x Light, 7=2x NOS. Silicon nuances verified:
+      - Program 3 [`4x Light`]: Hard-coupled in silicon to the internal Auto-
+        Clock Sequencer [`Reg 0x25 = 0x08`]. If any manual clock divider is
+        enabled [`Reg 0x25 = 0x0A`], Program 3 trips a DSP instruction/clock
+        fault [`Reg 0x5E = 0x40`, `Reg 0x76 = 0x85`] and mutes. Rather than
+        overriding user dividers without consent, the UI dynamically flags
+        `"4x Light !"` and displays a muteable `ConfirmModal` warning.
+      - Program 5 [`4x Fixed-Process`]: Permanently excluded; verified silent
+        across all manual, auto, and factory-reset clock combinations because
+        the extended miniDSP instruction/coefficient SRAM [Pages 44-62] is
+        fused off on PCM5122 silicon and only populated on PCM5142.)
+    * Reg 0x26 = 0x00 (Linear-Phase FIR filter default, or 0x01 Min-Phase FIR)
+    * Reg 0x07 = 0x00 (De-Emphasis Off/Flat default, or 0x10 On/Warm)
+    * Reg 0x3C = 0x22 (Zero-crossing volume ramp speed: Fast/Medium/Smooth)
+    * Reg 0x3D / 0x3E = 0x30 (Independent 0.5dB Digital Volume & L/R Balance)
+    * Reg 0x40 / 0x41 = Configurable Hardware Zero-Data Auto-Mute (Off, 105ms,
+      or 21ms, monitored live via Reg 0x6C & Reg 0x78)
+    * Reg 0x03 = 0x00 (Unmute digital L/R channels)
+  - Programmed Page 1 I2C registers on boot:
+    * Reg 0x01 = 0x00 (Lock negative charge-pump reference to VCOM mode)
+    * Reg 0x02 = 0x00 (0dB High Gain) or 0x11 (-6dB Low Gain)
+  - Caution: Never set Reg 0x25 = 0x3e (disabling BCK/FS error detection while
+    auto-clock divider is active freezes the internal DSP state machine).
+
+ISSUE D: Boot Glitching & Stray EMI on Infrared TX/RX Lines & Mic TDM Padding
+* Affected Pins:
+  - Pin 38 (Pad PI4 - I2S0 DIN / Dual ICS-43434 Mic Data)
+  - Pin 31 (Pad PI9 - IR Blaster TX Input)
+  - Pin 33 (Pad PH16 - IR Receiver Active-Low Output)
+* Root Cause & Fix:
+  1. Pin 38 (PI4 - Mic Data): ICS-43434 mics output 24-bit audio in a 32-bit
+     frame and tri-state (Hi-Z) the wire during the last 8 padding bits. The
+     PI1-PI4 Pull-Down (0x13C) clamps those unused trailing bits to 0V so they
+     cannot inject hiss into recordings.
+  2. Pin 31 (PI9 - IR Blaster): Active-high transistor input floated during
+     boot/idle. Added internal Pull-Down (PI_PULL0 @ 0x0300B13C, bits [19:18] =
+     0b10 -> 0x80000) so the IR LED stays strictly OFF (0V) at rest.
+  3. Pin 33 (PH16 - IR Receiver): Open-collector active-low sensor rests at
+     3.3V. Added internal Pull-Up (PH_PULL1 @ 0x0300B11C, bits [1:0] = 0b01 ->
+     0x1) to stiffen the 3.3V line and block phantom 50/60Hz ghost IR pulses.
+
+ISSUE E: USB Bus 3 (`usb 3-1`) Hub Stability, PHY Calibration & DAC Hot-Swap
+- Affected Port: USB Type-C Host Port (`5311000.usb` EHCI3 `usb3` / `5311400.usb`
+  OHCI3 `usb6`, paired with `5100400.phy phy_ctrl` & `pmu3`)
+- Symptom:
+  1. External USB 2.0 Hub (`1a40:0101`), BGVP MX1 composite USB DAC (`3302:43eb`),
+     and TP-Link UB500 BT (`2357:0604`) suffered hotplug drops, uncalibrated
+     `pmu3` PHY state (`0x00000000`), and stranded deconfigured DAC states
+     (`bConfigurationValue = 0`) across service restarts.
+  2. Suspending or unplugging the USB DAC while streaming Bluetooth A2DP caused
+     WirePlumber to fall back to `card 1: HDMI` (`alsa_card.platform-soc_ahub1_mach`),
+     which threw `-22 (EINVAL)` (`ASoC: error at __soc_pcm_open: -22`) and
+     aborted the active Bluetooth A2DP connection.
+- Root Cause:
+  1. Register Offset Trap (`+0x10` vs `+0x18`):
+     - Address `0x05310410` is the unused OHCI2 (`5310400.usb`) DMA pointer
+       register (`HcControlHeadED`).
+     - In `/proc/iomem`, the Allwinner H618 `pmu0..3` apertures are declared as
+       20-byte regions (`05101800-05101813`, `05200800-05200813`,
+       `05310800-05310813`, `05311800-05311813`). However, offset `+0x10`
+       (`0x810`) inside each PMU block and `phy_ctrl + 0x18` (`0x05100418`) are
+       internal control/reset registers that sit at `0x00000000` on boot.
+     - The TRUE hardware `PHY_TUNE` registers (holding factory `0x023438e4`)
+       reside 4 bytes past the `/proc/iomem` PMU reservation at offset `+0x18`
+       (`0x05101818`, `0x05200818`, `0x05310818`, `0x05311818`).
+     - Writing PHY calibration words into `0x810` or `0x05100418` corrupts the
+       EHCI 2.0 High-Speed state machine like a time bomb: the next time the
+       USB bus resets (`SET_ADDRESS`), `usb 3-1` fails with `error -71 (EPROTO)`
+       and the EHCI controller hands the port over to the `12Mbps` USB 1.1 OHCI
+       companion controller (`Bus 006`, setting `EHCI3_PORTSC` `0x05311054`
+       Bit 13 `PORT_OWNER = 1`), starving Bluetooth L2CAP buffers.
+  2. Composite USB DACs like the BGVP MX1 expose HID (`03`) on `:1.0` and Audio
+     (`01`) on `:1.1`/`:1.2`, and destroy all `:1.*` folders when deconfigured
+     (`bConfigurationValue = 0`).
+- Permanent Fix:
+  - Updated `OSKernel.apply_h618_usb_phy_boost()` to sanitize `phy_ctrl + 0x18`
+    (`0x05100418`) and `pmu0..3 + 0x10` (`0x810`) strictly to `0x00000000`, and
+    write the 4 selectable `USB PHY Boost` profiles exclusively to the true
+    `pmu0..3 + 0x18` (`0x818`) hardware registers:
+    * `0` Stock (`0x023438e4`: Factory Allwinner calibration, TXVREF=3, TXRISE=4)
+    * `1` Gentle Slew (`0x023228e4` default: TXVREF=3, TXRISE=2, PREEMP=2;
+      softens edges for low EMI while maintaining 480M High-Speed lock)
+    * `2` Low-EMI (`0x021108e4`: TXVREF=1, TXRISE=1, PREEMP=1)
+    * `3` Max-Boost (`0x027778e4`: TXVREF=7, TXRISE=7, PREEMP=7)
+  - Added automatic `Bus 006 (OHCI 12M) -> Bus 003 (EHCI 480M)` self-healing:
+    inspects `EHCI3_PORTSC` (`0x05311054`) Bit 13 (`PORT_OWNER == 0x2000`) and
+    `/sys/bus/usb/devices/6-[1-9]*`. If stranded on OHCI, it automatically
+    unbinds `5311400.usb` (OHCI) and `5311000.usb` (EHCI), rebinds `5311000.usb`
+    first to reclaim `480M` High-Speed lock on `Bus 003`, re-latches `0x818`,
+    and rebinds `5311400.usb` (or pulses `usbreset` on live UI toggles, while
+    `_restart_bt_daemon()` automatically reconnects `bt_primary_mac`).
+  - Adaptively locks `power/control = "on"` only on populated root hubs (`usb3`/`usb6`),
+    external hubs (`Class 09` / `1a40` / `214b`), and BT adapters (`Class e0` /
+    `2357` / `0bda`), allowing empty root hubs (`usb1`, `usb2`, `usb4`, `usb5`)
+    to clock-gate (`"auto"`).
+  - Disabled the broken HDMI card (`alsa_card.platform-soc_ahub1_mach`) and USB
+    mic (`~alsa_input.usb-*`) in `53-no-hearing-protection.conf` so USB DAC
+    suspend/unplug fails over to `ahub0` (PCM5122 I2S) in 0ms without dropping
+    Bluetooth A2DP.
+  - Updated `_get_usb_audio_path()` to scan all `:1.*` interfaces and detect
+    deconfigured leaf devices (`bConfigurationValue == 0`), and fixed udev
+    Bluetooth hotplug detection to check `device.sys_name` alongside `device_node`.
+
+
+2. REAL-TIME AUDIO ENGINE, DMA IRQ & SILICON NOISE-FLOOR OPTIMIZATIONS
+--------------------------------------------------------------------------------
+1. Split Pin-Direction Slew Rate Control (`PI_DRV0` @ `0x0300B134`):
+   - PI1 (BCK) & PI2 (WSEL) default to Level 2 (30mA) to cleanly drive the 3-way
+     split capacitance (`DAC` + `Mic 1` + `Mic 2`) without 40mA overshoot.
+   - PI3 (point-to-point DAC DIN) and PI4 (Mic DOUT) are clamped to Level 0
+     (10mA soft-slew, ~300 Ohm internal series impedance) to prevent 3.3V
+     overshoot ringing on the single-wire data line.
+2. I2C0 OLED Frame-Flush Spike Suppression (`PI5` SCL0 & `PI6` SDA0):
+   - Clamped PI5 and PI6 (bits [13:10] of `PI_DRV0`) to Level 0 (10mA) soft-slew
+     so 400 kHz OLED frame buffer flushes on the shared I2C0 bus do not inject
+     capacitive ground spikes into the PCM5122 substrate.
+3. PCM5122 Configurable FIR Filter (`I2S Filter`) & VCOM Charge-Pump Lock:
+   - Page 0, Reg 0x26 is live-configurable in the `I2S DAC` UI between `Linear`
+     (`0x00`, default Normal-Latency Linear-Phase FIR for full high-frequency
+     extension) and `Low-Lat` (`0x01`, Minimum-Phase FIR).
+   - Page 1, Reg 0x01 = 0x00 locks the internal negative rail to VCOM mode for
+     ~6 dB higher Power Supply Rejection Ratio (PSRR) on the 3.3V rail.
+4. Split-Core IRQ Isolation (Core 2 USB/BT vs. Core 3 I2S DMA):
+   - Pinning USB (`ehci_hcd`, `ohci_hcd`, `musb-hdrc`) onto the same core as
+     PipeWire `SCHED_FIFO 88` starves the kernel's L2CAP bottom-half receiver
+     (`Bluetooth: Dropping L2CAP data: receive buffer overflow` / 2x speed
+     catch-up jitter).
+   - Fixed by isolating USB Controller IRQs onto **Core 2 (`smp_affinity = 4`)**
+     and Allwinner I2S DMA (`3002000.dma-controller` / `ahub`) strictly onto
+     **Core 3 (`smp_affinity = 8`)**, running both Cores 2 and 3 under the
+     `performance` governor.
+5. Thread-Specific PipeWire `data-loop` RT Pinning (Hotplug Deadlock Fix):
+   - Applying `chrt -a -f -p 88` and `taskset -a -p -c 3` to *all* PipeWire
+     threads (`-a`) forces both `main-loop` (`pipewire` socket/udev control
+     thread) and `data-loop.0` (real-time ALSA thread) onto Core 3 at equal RT
+     priority. Unplugging a USB DAC causes `data-loop.0` to block in
+     `unix_stream_sendmsg` while holding an RT mutex that `main-loop` blocks on
+     in `futex_lock_pi` (`rt_mutex_schedule`), freezing PipeWire for 30s.
+   - Fixed in `OSKernel.apply_rt_cpu_state()` by scanning `/proc/<pid>/task/*/comm`
+     and applying `SCHED_FIFO 88` + Core 3 affinity **exclusively to `data-loop*`**,
+     while keeping the `pipewire` control thread at `SCHED_OTHER` on Cores 0-2
+     and retaining the kernel's `950000` (95%) `sched_rt_runtime_us` safety valve
+6. Shaped Noise Dithering (`dither.method = "wannamaker3"`) & HDMI Card Disable:
+   - Uses `wannamaker3` dithering on `S32LE` ALSA outputs while setting
+     `device.disabled = true` on `alsa_card.platform-soc_ahub1_mach` (broken
+     HDMI audio) and `node.disabled = true` on `~alsa_input.usb-*` so USB DAC
+     hot-swaps never hit `-22 (EINVAL)` or drop Bluetooth A2DP streams.
+
+
+3. HARDWARE EQUIVALENT MAP OF REGISTER MODIFICATIONS
+--------------------------------------------------------------------------------
+Software / Register Mod               | Physical Hardware Equivalent
+--------------------------------------|-----------------------------------------
+PI_DRV0 = Level 0 (10mA)              | In-Line Ferrite Bead / 220-300 Ohm
+(On DIN, DOUT, and I2C0 OLED wires)   | Series Termination Damping Resistor
+--------------------------------------|-----------------------------------------
+PI_DRV0 = Level 2 (30mA, Default)     | Dedicated Clock Buffer / Matched
+(On BCK & WSEL 3-way clock split)     | Low-Impedance Line Driver IC
+--------------------------------------|-----------------------------------------
+PI_PULL0 = Pull-Down (0x13C)          | 50 kOhm Static Bleed Resistor to
+(On PI1-PI4 I2S & PI9 IR Blaster)     | 0V Ground
+--------------------------------------|-----------------------------------------
+PH_PULL1 = Pull-Up (0x11C)            | 50 kOhm Pull-Up Stiffening Resistor to
+(On PH16 Active-Low IR Receiver)      | 3.3V VCC Rail
+--------------------------------------|-----------------------------------------
+PCM5122 Page 1, Reg 0x01 = 0x00       | Low-ESR Decoupling Capacitor on the
+(VCOM Charge-Pump Reference Lock)     | Analog Negative Supply Rail
+--------------------------------------|-----------------------------------------
+USB PHY = 0x023228e4 (0x05100418 &    | Active USB 2.0 Eye-Diagram Conditioner /
+0x05311810 Gentle Slew / 4-Profile)   | Slew-Rate Controlled Redriver IC
+
+
+4. SUMMARY PINOUT & SILICON PAD CONFIGURATION TABLE
+--------------------------------------------------------------------------------
+Header Pin | SoC Pad | Function / Peripheral       | Pull Config | Drive (PI_DRV0)
+-----------|---------|-----------------------------|-------------|----------------
+Pin 12     | PI1     | I2S0 BCLK (DAC + Mic 1 & 2) | Pull-Down   | Level 2 (30mA)
+Pin 35     | PI2     | I2S0 WSEL (DAC + Mic 1 & 2) | Pull-Down   | Level 2 (30mA)
+Pin 40     | PI3     | I2S0 DOUT (To PCM5122 DIN)  | Pull-Down   | Level 0 (10mA)
+Pin 38     | PI4     | I2S0 DIN  (From Mics DAT)   | Pull-Down   | Level 0 (10mA)
+Pin 3, 5   | PI6,PI5 | I2C0 SDA, SCL (OLED/UPS/DAC)| Ext Pull-Up | Level 0 (10mA)
+Pin 31     | PI9     | IR Blaster TX (gpio-ir-tx)  | Pull-Down   | Default (20mA)
+Pin 33     | PH16    | IR Receiver RX (gpio-ir-rx) | Pull-Up     | Input (N/A)
+Pin 7,19.. | PH5-PH8 | Matrix Keypad Columns       | Pull-Up     | Input (libgpiod)
+Type-C USB | USB3 PHY| 480M Host (Hub + BT + DAC)  | 15kPD/45Ohm | Gentle (0x023228e4)
+
+4B. COMPLETE 40-PIN HEADER PINOUT & OFF-PI WIRING SCHEMA
+--------------------------------------------------------------------------------
+* Even Pins:
+  - Pin 2:  VCC IR blast (5V)
+  - Pin 4:  VCC Amp (MAX97220 5V rail for full +/-5V swing and 80dB PSRR)
+  - Pin 12: BCLK DAC, BCLK Mic 1, BCLK Mic 2 (3-way shared I2S0 Bit Clock)
+  - Pin 14: GND IR receiver
+  - Pin 20: GND IR blast
+  - Pin 24: R3 (Keypad Row 3)
+  - Pin 26: C3 (Keypad Column 3)
+  - Pin 30: GND Mic 1, SEL Mic 1 (Sets Mic 1 to Left channel), GND Mic 2
+  - Pin 34: EMPTY / UNPLUGGED (Removed MAX97220 VCC GND to break Pin 25 <-> Pin 34 ground loop)
+  - Pin 38: DAT Mic 1, DAT Mic 2 (Stereo I2S0 Data In from Mics to Pi)
+  - Pin 40: DIN DAC (I2S0 Data Out from Pi to PCM5122 DAC)
+
+* Odd Pins:
+  - Pin 1:  VCC OLED (3.3V)
+  - Pin 3:  SDA OLED, SDA DAC (Shared I2C0 SDA with UPS @ 0x43, OLED @ 0x3C, DAC @ 0x4C)
+  - Pin 5:  SCL OLED, SCL DAC (Shared I2C0 SCL)
+  - Pin 7:  C4 (Keypad Column 4, PI12 / GPIO 268)
+  - Pin 11: R1 (Keypad Row 1)
+  - Pin 13: R2 (Keypad Row 2)
+  - Pin 17: VCC IR receiver, VIN DAC, MOD2 DAC (Bridged to VIN to latch I2C mode @ 0x4C), 3V Mic 1, 3V Mic 2, SEL Mic 2 (Sets Mic 2 to Right channel)
+  - Pin 19: C1 (Keypad Column 1)
+  - Pin 21: C2 (Keypad Column 2)
+  - Pin 23: R4 (Keypad Row 4)
+  - Pin 25: GND DAC (Shared with MAX97220 Amp IN GND via copper trace extender — single-point star ground)
+  - Pin 31: IN IR blast (Moved from Pin 12 to Pin 31 / PI9 to free Pin 12 for I2S0 BCLK)
+  - Pin 33: OUT IR receiver (PH16)
+  - Pin 35: WSEL DAC, WS Mic 1, WS Mic 2 (3-way shared I2S0 Word Select / LRCK)
+  - Pin 39: GND OLED
+
+* HAT Pins:
+  - Waveshare UPS HAT (C) for Pi Zero uses Pins 1, 2, 3, 4, 5, 6 (INA219 @ 0x43 on I2C0)
+
+* Direct Board-to-Board Connections (Off-Pi Wiring: PCM5122 -> MAX97220):
+  - Lout (PCM5122) -> L of IN (MAX97220) — Left analog audio signal
+  - Rout (PCM5122) -> R of IN (MAX97220) — Right analog audio signal
+  - GND (PCM5122 / Pin 25 copper extender) -> GND (between L & R of IN on MAX97220) — Single-point power & differential audio ground reference
+  - Leave GND (next to VCC) on MAX97220 Amp board UNPLUGGED (Pin 34 empty).
+  - Leave GND (between L & R of OUT) on MAX97220 Amp board EMPTY.
+
+
+5. ALLWINNER H618 PIO & USB PHY REGISTER REFERENCE (/dev/mem)
+--------------------------------------------------------------------------------
+A. PIO Controller (Base: 0x0300B000)
+- PI_CFG0  (Offset 0x120): Pinmux function for PI0..PI7 (0x75544447 when active)
+- PI_DRV0  (Offset 0x134): Drive strength for PI0..PI15 (2 bits/pin: 00=10mA,
+                           01=20mA, 10=30mA, 11=40mA)
+  -> Mask: `(val & ~0x3FFC) | ((lvl << 2) | (lvl << 4))` sets PI1..PI2 to
+     `lvl` (default Level 2 = 30mA) and clamps PI3..PI6 to Level 0 (10mA).
+- PI_PULL0 (Offset 0x13C): Pull resistor for PI0..PI15 (2 bits/pin: 00=Off,
+                           01=Pull-Up, 10=Pull-Down)
+  -> Mask: `(val & ~0x000C03FC) | 0x000802A8` sets PI1..PI4 and PI9 to Pull-Down.
+- PH_PULL1 (Offset 0x11C): Pull resistor for PH16..PH31 (2 bits/pin)
+  -> Mask: `(val & ~0x3) | 0x1` sets PH16 to Pull-Up.
+
+B. Shared USB PHY Control & USB0..3 PMU (Bases: 0x05100000, 0x05101000, 0x05200000, 0x05310000, 0x05311000)
+- PMU0..3_PHY_TUNE (Offset 0x818: `0x05101818`, `0x05200818`, `0x05310818`, `0x05311818`):
+  -> Bits [23:20] = TXVREF, Bits [19:16] = TXRISE, Bits [13:11] = PREEMP,
+     Bits [11:0]  = 0x8e4 termination/bias baseline.
+  -> Profiles:
+     * `0` Stock:       `0x023438e4` (TXVREF=3, TXRISE=4, PREEMP=7)
+     * `1` Gentle-Slew: `0x023228e4` (TXVREF=3, TXRISE=2, PREEMP=2, Default)
+     * `2` Low-EMI:     `0x021108e4` (TXVREF=1, TXRISE=1, PREEMP=1)
+     * `3` Max-Boost:   `0x027778e4` (TXVREF=7, TXRISE=7, PREEMP=7)
+  -> Critical Sanitization Rule: Always keep `phy_ctrl + 0x18` (`0x05100418`)
+     and `pmu0..3 + 0x10` (`0x810`) at `0x00000000`. Writing tune values into
+     `0x418` or `0x810` breaks EHCI High-Speed `SET_ADDRESS` (`error -71`) and
+     forces fallback to `Bus 006` (OHCI 1.1). Never write to `0x05310410`
+     (OHCI2 `5310400.usb` DMA pointer).
+- USB3_HCI_ICR (0x05311800, Offset 0x800): High-Speed EHCI passby & clock
+  control (`0x00000701`).
+- EHCI3_PORTSC (0x05311054, Offset 0x054): Port Status & Control (`0x00001005`
+  when locked at 480M High-Speed on `Bus 003`; Bit 13 `0x2000` `PORT_OWNER=1`
+  indicates port was handed off to `Bus 006` OHCI 1.1 companion controller).
+
+
+6. QUICK DIAGNOSTIC & RECOVERY COMMANDS
+--------------------------------------------------------------------------------
+# 1. Check if I2S ALSA hardware is sleeping (`closed`) or active (`RUNNING`):
+cat /proc/asound/card0/pcm0p/sub0/status
+
+# 2. Verify PipeWire Real-Time SCHED_FIFO Priority (88) & Core 3 Pinning:
+chrt -p $(pgrep -x pipewire)
+taskset -cp $(pgrep -x pipewire)
+grep -iE 'ehci|ohci|musb|dma-controller' /proc/interrupts
+
+# 3. Inspect live Allwinner H618 PIO & USB PHY registers in RAM:
+sudo python3 - << 'EOF'
+import os, mmap, struct
+fd = os.open("/dev/mem", os.O_RDONLY | os.O_SYNC)
+m_pio  = mmap.mmap(fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ, offset=0x0300B000)
+m_phy0 = mmap.mmap(fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ, offset=0x05100000)
+m_pmu3 = mmap.mmap(fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ, offset=0x05311000)
+print("PI_CFG0   (0x0300B120):", hex(struct.unpack("<I", m_pio[0x120:0x124])[0]))
+print("PI_DRV0   (0x0300B134):", hex(struct.unpack("<I", m_pio[0x134:0x138])[0]))
+print("PI_PULL0  (0x0300B13C):", hex(struct.unpack("<I", m_pio[0x13C:0x140])[0]))
+print("PH_PULL1  (0x0300B11C):", hex(struct.unpack("<I", m_pio[0x11C:0x120])[0]))
+print("PHY_CTRL_418 (0x05100418 - Must be 0x0):", hex(struct.unpack("<I", m_phy0[0x418:0x41C])[0]))
+print("PMU3_CTRL_810(0x05311810 - Must be 0x0):", hex(struct.unpack("<I", m_pmu3[0x810:0x814])[0]))
+print("PMU3_TUNE_818(0x05311818 - Active Tune):", hex(struct.unpack("<I", m_pmu3[0x818:0x81C])[0]))
+print("EHCI3_PORTSC (0x05311054 - 480M Status):", hex(struct.unpack("<I", m_pmu3[0x054:0x058])[0]))
+m_pio.close(); m_phy0.close(); m_pmu3.close(); os.close(fd)
+EOF
+
+# 4. Emergency PCM5122 I2C Soft-Reset & 3-Wire PLL Recovery (Address 0x4c):
+i2cset -y 0 0x4c 0x00 0x00
+i2cset -y 0 0x4c 0x01 0x10
+sleep 0.1
+i2cset -y 0 0x4c 0x01 0x00
+i2cset -y 0 0x4c 0x02 0x00
+i2cset -y 0 0x4c 0x0d 0x10
+i2cset -y 0 0x4c 0x25 0x08
+i2cset -y 0 0x4c 0x26 0x01
+i2cset -y 0 0x4c 0x41 0x00
+i2cset -y 0 0x4c 0x03 0x00
+i2cset -y 0 0x4c 0x00 0x01
+i2cset -y 0 0x4c 0x01 0x00
+i2cset -y 0 0x4c 0x00 0x00
+================================================================================
+7. WAVESHARE UPS HAT (INA219 0x43), MAX97220 STAR-GROUND & LAST-MILE RT FIXES
+--------------------------------------------------------------------------------
+A. Waveshare UPS HAT INA219 (0x43) 1.88 kHz Rail Whine & I2C0 Bus Silence:
+* Root Cause:
+  1. By default (`Config Reg 0x00 = 0x199F`, read as `0x9f19` little-endian),
+     the INA219 runs in continuous un-averaged 12-bit ADC mode (`532 us` period),
+     switching its internal charge-pump multiplexer at 1.88 kHz on the shared
+     3.3V rail (Pin 1 / Pin 17) feeding the PCM5122 DAC and ICS-43434 Mics.
+  2. Polling `0x43` every 2 seconds injected 400 kHz I2C clock edges onto
+     Pins 3 & 5 (shared directly with the PCM5122 DAC at `0x4c`).
+* Permanent Fix (`src/hardware/power_monitor.py`):
+  - Configured `bus_adc=ADC_128SAMP` and `shunt_adc=ADC_128SAMP` (`68.10 ms`
+    128-sample hardware DSP filter, reducing internal switching below 14.6 Hz
+    infrasonic).
+  - Duty-cycled the INA219 via `self.ina.wake()` -> `sleep(0.14)` -> read ->
+    `self.ina.sleep()` once every 15s (awake) / 30s (screen off).
+  - Verification: `i2cget -y 0 0x43 0x00 w` returns `0xf81f` (`0x1FF8` =
+    `ADC_128SAMP` + `MODE=000` Hardware Power-Down), keeping the INA219 at 0 Hz
+    switching for >99% of playback time.
+
+B. MAX97220 5V Headroom Retention & Grounding Topologies Tested:
+- Empirical Ground Setup Comparison (Why Only Setup 3 Eliminates White Noise):
+  1. Setup 1 — Both `VCC GND` (Pin 34) AND `IN GND` (Pin 25 DAC extender)
+     connected simultaneously:
+     * Result: Loud broadband "shhhh" white noise.
+     * Physics: Because `VCC -` and `IN GND` are tied to the same internal
+       copper plane on the red MAX97220 PCB, connecting both creates a closed
+       ground loop across the Banana Pi PCB (`Pin 25 <-> Pin 34`). High-speed
+       1.5 GHz CPU / 400 MHz RAM CMOS shoot-through currents and 1 MHz UPS
+       boost-converter hash circulate through the loop and get amplified.
+  2. Setup 2 — Only `VCC GND` (Pin 34) connected; `IN GND` removed/unplugged
+     from the DAC (`Pin 25`):
+     * Result: Severe white noise and ground-reference hiss.
+     * Physics: Leaves the MAX97220 differential input and `B10K` potentiometer
+       without a local 0.000V reference to the PCM5122 DAC, forcing the single-
+       ended audio return path to traverse the noisy Banana Pi ground plane
+       between Pin 25 and Pin 34.
+  3. Setup 3 (ACTIVE OPTIMAL SETUP) — `VCC GND` (Pin 34) removed/unplugged;
+     ONLY `IN GND` (between `L` & `R` of `IN`) shared with PCM5122 `GND`
+     (Pin 25) via the copper trace extender:
+     * Result: Eliminates broadband ground-loop white noise while retaining
+       full +/-5V swing (125 mW) via Pin 4 (`5V VCC`).
+
+C. Core 3 C-State Idle Lock, Unthrottled RT Runtime & Wi-Fi Beacon Suppression:
+* Core 3 `cpuidle` C-State Disable:
+  - Writes `1` to `/sys/devices/system/cpu/cpu3/cpuidle/state*/disable` when
+    Real-Time CPU mode is ON, eliminating 50-150 us wakeup jitter and 46.8 Hz
+    idle-to-active current modulation on the 3.3V/5V rails.
+- 95% Real-Time Safety Valve (`sched_rt_runtime_us = 950000`):
+  - Keeps `/proc/sys/kernel/sched_rt_runtime_us` at `950000` (95%) rather than
+    `-1` so an ALSA hotplug hiccup can never hard-lock the Linux kernel.
+* Broadcom Wi-Fi Beacon Power-Save Lock (`iw dev wlan0 set power_save off`):
+  - Disables dynamic 102.4 ms DTIM beacon sleep on `wlan0` while Wi-Fi is on,
+    eliminating 9.76 Hz ("putt-putt") 300 mA RF wakeup spikes on the 3.3V rail.
+
+D. Residual "Peep-Peep" Load-Step Transients, Pre-Pot Bounce & 10-Ohm RC Fix:
+- Symptom, IEM Sensitivity & Pre-Potentiometer Proof:
+  - With broadband white noise eliminated via Setup 3 (`Pin 34` removed),
+    faint rhythmic "peep-peep" chirps remain audible on low-impedance / high-
+    sensitivity IEMs (e.g., 12-16 Ohm, >110 dB/mW) during heavy CPU load
+    (VS Code SSH), OLED refreshes, and Wi-Fi/BT packet bursts.
+  - Empirical Proof (The `B10K` Knob Observation):
+    * Turning the physical green `B10K` potentiometer knob on the red MAX97220
+      board UP increases the "peep-peep" volume, and turning it DOWN to 0%
+      silences it.
+    * Because the `B10K` knob sits at the `IN` stage *before* the `AIF BCD`
+      amplifier IC, this proves the noise is NOT post-potentiometer internal
+      chip noise. Instead, 5V load-step spikes entering `VCC +` (Pin 4) flow
+      through the onboard `100 16V VT` (100 uF) capacitor and exit out the
+      single shared `IN GND` trace to the DAC (Pin 25). That return current
+      creates a small voltage drop (`V = I * R`) along the `IN GND` bridge,
+      causing the Amp's local ground to bounce relative to the DAC's `L`/`R`
+      output right in front of the `B10K` potentiometer.
+    * Why an Output Impedance Adapter is an Illusion Here: Adding a 3.5mm
+      impedance adapter at the output and compensating for the volume loss by
+      turning the physical `B10K` knob UP scales both the music and the pre-pot
+      `IN GND` bounce equally, yielding zero SNR improvement.
+- Hardware Fix Options (To Test):
+  1. Zero-Part Upstream Gain Staging: Maximize volume *before* the `IN GND`
+     wire (keep Pi OS volume at 80-100% and PCM5122 `I2S Gain` at `High 2.1V`)
+     and turn the physical green `B10K` knob DOWN as low as possible. This
+     boosts clean DAC voltage while physically attenuating the `IN GND` bounce
+     before it enters the `AIF BCD` amplifier IC.
+  2. In-Line 10-Ohm Resistor on Pin 4 (`5V VCC +` Wire):
+     * Splice a single `10 Ohm` (1/4W) resistor in series inside the wire
+       running from Banana Pi Pin 4 (`5V`) to the red board's `VCC +` pin:
+       `[Pin 4 (5V)] ---> [ 10 Ohm Resistor ] ---> [Red Amp Board VCC '+' Pin]`
+     * How it works with the existing `100 16V VT` (100 uF) capacitor:
+       Turns the onboard 100 uF bass-reservoir capacitor into a true hardware
+       RC Low-Pass Filter (`fc = 1 / (2 * pi * 10 Ohm * 100 uF) = 159 Hz`).
+     * Why 10 Ohms is the exact sweet spot:
+       - `< 2.2 Ohms`: Cutoff (`> 723 Hz`) is too high to block 1-4 kHz chirps.
+       - `10 Ohms` (Optimal): Blocks >85% of 1-4 kHz load-step chirps (`fc =
+         159 Hz`) while dropping only `0.10V` at idle (`10 mA`) and `0.35V` on
+         bass peaks (`35 mA`), preserving ~4.65V-4.90V headroom. Also stops
+         high-frequency 5V return spikes from exiting through `IN GND`.
+       - `> 47 Ohms`: Causes severe voltage sag (`> 1.5V` drop) and clipping
+         on bass transients. (Note: RC series resistors only work on low-
+         current `< 60 mA` analog stages, never on high-current digital rails).
+
+E. Onboard X-Powers AXP313A PMIC (`i2c-6 @ 0x36`, Chip ID `0x4B`) Conditioning:
+- Root Cause:
+  1. By default (`Reg 0x12 = 0x00`, `Reg 0x1A = 0x20`), the AXP313A runs its
+     three step-down buck converters (`DCDC1` 0.9V SYS/USB/DMA, `DCDC2` 1.1V
+     CPU, `DCDC3` 1.1V LPDDR4 DRAM) in Auto PFM/PWM Discontinuous Burst Mode
+     without Dynamic Voltage Scaling (DVM) ramp slew limiting.
+  2. When CPU/bus load fluctuates, `DCDC2` snaps voltage instantaneously and
+     PFM mode skips pulses in the audible 1-20 kHz band, producing `80.0 mV p-p`
+     (`13.66 mV stdev`) bus ripple and `2.57 mV p-p` shunt spikes on the
+     upstream 5V rail (measured via high-speed 12-bit INA219 capture).
+- Permanent Fix (`OSKernel.apply_axp313a_pmic_mode` & `DSP & Engine -> PMIC Power`):
+  - Note: On AXP313A (`Reg 0x03 = 0x4b`), `Reg 0x11` is unmapped (`0x00`);
+    `Reg 0x12` (writable mask `0xb7`) controls DCDC PWM (`bits [2:0]`) and
+    Spread-Spectrum (`bit 7`, `bits [5:4]`), while `Reg 0x1A` (`bits [1:0]`)
+    enables 15.625 mV/us DVM soft voltage ramping on `DCDC1` & `DCDC2`.
+  - Configurable across 4 modes ordered from Stock to most aggressive:
+    * `0` Stock (`PFM`):   `0x12=0x00, 0x1A=0x20` (80.0mV p-p bus, 2.57mV shunt)
+    * `1` DVM Smooth:      `0x12=0x00, 0x1A=0x23` (48.0mV p-p bus, 1.99mV shunt)
+    * `2` Fixed PWM (Def): `0x12=0x07, 0x1A=0x23` (48.0mV p-p bus, 7.62mV stdev
+      — cuts bus voltage ripple by 44% and locks 1.5 MHz continuous PWM)
+    * `3` Spread PWM:      `0x12=0x87, 0x1A=0x23` (25 kHz spread-spectrum + DVM)
+
+# Quick Verification Commands for Section 7:
+i2cget -y 0 0x43 0x00 w
+sudo i2cget -f -y 6 0x36 0x12 && sudo i2cget -f -y 6 0x36 0x1a
+grep . /sys/devices/system/cpu/cpu3/cpuidle/state*/disable 2>/dev/null
+sysctl kernel.sched_rt_runtime_us
+iw dev wlan0 get power_save
+================================================================================

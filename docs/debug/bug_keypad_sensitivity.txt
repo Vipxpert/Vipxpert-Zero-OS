@@ -1,0 +1,22 @@
+# /vipxpert_minimal_os/docs/debug/bug_keypad_sensitivity.txt
+# Bug Ledger: 4x4 Matrix Keypad Sensitivity Asymmetry & All-Button Responsiveness
+# Status: RESOLVED (Verified by user in CR-535)
+
+# Stage: Symptom & Context
+User reports Key '4' (R2xC1: GPIO 227 x GPIO 231) and earlier R1/C1 keys feel insensitive compared to '*' (R4xC1: GPIO 230 x GPIO 231), and requests improving all 16 buttons' sensitivity uniformly without compromising hold/repeat, ghosting immunity, CPU, OLED, or audio.
+
+# Stage: Proven Findings
+1. In `src/hardware/keypad.py` (CDR-529), only Row 1 (`r_idx == 0`) received 2.4ms RC settle while Rows 2..4 (`'4'` is on Row 2, `r_idx == 1`) kept 1.2ms settle.
+2. `scan_matrix_sync()` gated sampling on a single initial `get_value(c_pin) == Value.INACTIVE` read: if sample #1 bounced HIGH during membrane closure, samples #2 and #3 were never taken.
+3. `_hardware_scan_loop()` and `poll_keys()` communicate via a single overwritten `_raw_active_key` / `_latched_key` scalar polled every `master_poll_interval` (12ms), which adds up to ~25ms jitter and drops back-to-back fast taps.
+4. `ROWS` currently use `Drive.PUSH_PULL` (`3.3V` active high) instead of `Drive.OPEN_DRAIN` (`High-Z` inactive, active low sink).
+
+# Stage: Eliminated Approaches
+- Slow 50ms (`20Hz`) polling + strict consecutive `2 x 5ms` all-low check (missed crisp <65ms taps).
+- Asymmetric Row-1-only 2.4ms settle + single-sample gatekeeper (left Row 2 `'4'` under-settled and vulnerable to initial contact bounce).
+
+5. `P-533` confirmed `*` wakes on `DOWN` while `4` (`Previous` / menu multiplier) and `1..9/C/D` act on `CLICK`, so the old two-stage `poll_keys()` `asyncio.sleep(12ms)` loop added up to ~24ms extra delay before `CLICK` fired and dropped rapid taps.
+6. Patched in `CDR-534`: Switched all 4 rows to `Drive.OPEN_DRAIN + Bias.PULL_UP`, unconditional 3-pass batch `get_values(COLS)` 2-of-3 majority voting (~10.7ms / 93Hz full-matrix cycle), 1-sweep Schmitt-trigger release hysteresis, and direct `loop.call_soon_threadsafe` `asyncio.Queue` wake on Cores `0,2`.
+
+# Stage: Isolation & Verification Plan
+Verify live boot, `<1.5%` CPU on Cores `0,2`, zero false/ghost triggers while idle, and user tactile test across `'4'`, Row 1 (`1,2,3,A`), Col 1 (`1,4,7,*`), and all 16 buttons.

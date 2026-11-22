@@ -1,0 +1,12 @@
+# /vipxpert_minimal_os/docs/trees/tree_app_hotspot.txt
+/vipxpert_minimal_os
+├── vipxpert_os.service (Systemd configuration for automatic boot execution and persistence)
+    └── /src
+        └── /apps
+            ├── hotspot_app.py (Simple menu for toggling hardware AP mode and managing broadcast credentials)
+                └── -> HotspotManagerApp (Non-blocking Wi-Fi AP poller and execution handler pulling from SQLite defaults)
+                    ├── update() (Silent background loop polling nmcli every 5 seconds to keep the UI toggle in sync with the hardware radio)
+                    ├── _check_status() (Strictly queries NetworkManager for active Hotspot connections tethered to wlan0)
+                    ├── _toggle_hotspot() (Executes root-level connection teardown or radio hijack to spin up the Access Point)
+                    ├── _edit_ssid() / _edit_pwd() (Mounts TextInputModal to update broadcast credentials and saves them to the local database)
+                    └── _rebuild_menu() (Constructs the UI rows mapping to actions and dynamically clears blocking toasts to release the UI lock)

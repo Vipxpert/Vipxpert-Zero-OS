@@ -1,0 +1,14 @@
+# /vipxpert_minimal_os/docs/trees/tree_wifi.txt
+/vipxpert_minimal_os
+├── vipxpert_os.service (Systemd configuration for automatic boot execution and persistence)
+    └── /src
+        └── /apps
+            ├── wifi_app.py (Asynchronous Wi-Fi manager parsing direct nmcli hardware states via sudo)
+                ├── -> WiFiSubMenu (Dynamic dictionary-based context menu generated on-the-fly for specific network interactions)
+                └── -> WiFiManagerApp (Non-blocking network poller, radio hardware manager, and execution handler)
+                    ├── _auto_poll() (Silent background loop utilizing lightweight zero-cost hardware syncs to mirror the global OS policy without draining battery)
+                    ├── _fetch_list() (Checks global radio state to safely bypass or execute sudo-authorized nmcli scans, building UI lists with dynamic footers)
+                    ├── _force_rescan() (Executes a physical sudo-authorized 5-second environment sweep while locking the UI)
+                    ├── _toggle_radio() (Asynchronously flips the global Wi-Fi hardware radio state with root privileges)
+                    ├── handle_key() (Routes policy cycling, radio toggles, and mounts context-aware WiFiSubMenu by reading dictionary keys)
+                    └── execute_cmd() (Translates UI actions into root-level nmcli modifications protected by hardware blocking toasts)

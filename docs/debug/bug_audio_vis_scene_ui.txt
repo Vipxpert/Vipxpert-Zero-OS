@@ -1,0 +1,27 @@
+# /vipxpert_minimal_os/docs/debug/bug_audio_vis_scene_ui.txt
+# Stage: Symptom & Target Invariant
+1. Dashboard battery status sometimes renders blank instead of showing voltage/percentage/icon.
+2. Per-scene customization settings are incomplete.
+3. Clicking a scene slot must navigate: Slot -> Scene Category list -> Category's Scene list -> Live Scene Preview (A/B switches scenes, C confirms/saves scene for the slot, D goes back without saving; scenes that override A/B/C/D must not intercept those keys while in preview mode).
+4. Visualizer reacts weakly to frequencies between bar centers and stops reacting above ~17kHz (no response up to 20kHz).
+
+# Stage: Functionality & Prerequisite Checklist
+- [PASS - USER VERIFIED] 1. Dashboard battery status/icon renders live voltage/current/percent without blanking or 3s I2C0 stutters (Fixed in CDR-375; verified LIVE DB `4.060|0.2|86.00`)
+- [PASS] 2. Per-scene customization settings complete across all 16 scenes with C + 4/6 tuning, truthful Custom badges, and Reset Scene (Completed in CDR-385/386/387)
+- [PASS] 3. Slot -> Category List -> Scene List -> Live Scene Preview flow with A/B switch, C confirm, D back without saving, and A/B/C/D override suppression (Completed in CDR-385/386/387)
+- [PASS - USER VERIFIED] 4. Visualizer FFT windowing/bin aggregation covers inter-bar frequencies smoothly and extends full sensitivity up to 20kHz (User verified 20kHz response works fine)
+
+# Stage: Eliminated Approaches & Touched Scopes
+- [DN-258] | /docs/debug/bug_audio_vis_scene_ui.txt (TOP) | Initialized 6-item session backlog ledger | Probing tree_core_app.txt, scene_manager.py, /src/apps, and /src/scenes in DP-259
+- [CDP-288] | /src/apps/dashboard.py & /src/hardware/power_monitor.py | `DashboardApp` hid `Bat:`/`Pwr:` whenever `error=True` and `PowerMonitor` exited thread with `return` if boot `INA219` init failed | Did not prevent `Errno 11` on restart; `Bat:` was also pushed to row 4 below the 3-row viewport
+- [CDPR-321] | /src/hardware/power_monitor.py, /src/apps/dashboard.py, /src/scenes/* | Added SQLite `last_bat_state` caching, 145ms `ADC_128SAMP` settle, and moved `Bat:` into top 3 rows | Still hit `Hardware init deferred ([Errno 11])` on restart before `last_bat_state` could be populated, leaving dashboard on `Probing...`
+- [CDR-331] | /src/hardware/power_monitor.py | Replaced `pi-ina219` with STOP-separated `_SMBusINA219` + 6x 3ms `Errno 11` retries | Still logged `Hardware init deferred ([Errno 11])` at `02:13:55` right as `[UIManager] Display I2C0 pin reset/fault detected` ran
+
+# Stage: Isolation & Telemetry Plan
+1. DPR-348 + PR-352 + P-355 findings: When `5002000.i2c` is rebound cleanly, `0x4C` and `0x43` (`BusV=4.040V`) respond 100% cleanly! However, at boot (`t=0s`), `OSKernel.recover_i2c0_bus()` writes `0x01` to `TWI0_SRST` (`0x1C`), leaving `TWI0_STAT` (`0x10`) at `0x00` (and clearing `TWI0_CNTR` `TWSIEN` bits behind `mv64xxx_i2c`'s back). Then at `t=2.0s`, `UIManager._apply_pcm5122_i2c_gain()` checks `if twi_m[0x10] in (0x00, 0x38): twi_m[0x1C:0x20] = 0x01`, wiping `TWI0_CNTR` right as `PowerMonitor` addresses `0x43` (`state: 0x2, status: 0x0` -> `Errno 11`), and `UIManager._check_and_heal_pcm5122()` repeats this every 3s because `twi_m[0x10] == 0x00`!
+2. DPR-361..DPR-372 + CDR-375 Fix Applied & User-Verified ("Seems worked", LIVE DB `4.060|0.2|86.00`, 0 I2C0 faults/stutters):
+   - Proven dual root cause: (a) `PowerMonitor` held `I2C_BUS_LOCK` across `time.sleep(0.145)` (`179ms` freeze in DPR-372) and relied on `shm[12:16]=1` (which `Display.show()` overwrote after `31ms` in DPR-361), causing `0x43` vs `0x3C` collisions (`STAT=0xF9`/`0x38`, `Errno 11`); (b) `UIManager._check_and_heal_pcm5122()` treated `STAT==0x00`/`0x38` as a fault every 3s and fired `_apply_pcm5122_i2c_gain(pulse_standby=True)` (`Reg 0x02=0x11` mute + `0x4D` NACK + `TWI0_SRST`), causing a repeating 3-second UI scroll + audio stutter loop across every screen.
+   - Fixed in `CDR-375` (`power_monitor.py`, `ui_manager.py`): moved `time.sleep(0.145)` outside `I2C_BUS_LOCK` (`<1.2ms` 100kHz-scoped bursts), removed `shm[12:16]` writes from `PowerMonitor`/`UIManager`, restricted `_check_and_heal_pcm5122` strictly to `shm[32:36]` pin-reset counter changes with `pulse_standby=False`, and deleted temporary `/tests/diag_ina219_i2c0.py`.
+3. CDR-383 Feature Completion (Pending User Verification):
+   - Completed per-scene customization settings across all 16 scenes (`clock_digital`, `clock_analog`, `music_classic`, 4 Visualizer HUDs, `bad_apple`, 5 Interactive Savers including `ambient_pond` & `ambient_bounce`, and 4 Hardware Scopes) with bidirectional `C` + `4/6` (`< >`) tuning, truthful `Custom >` detection via `_is_scene_customized()`, and one-click `Reset Scene`.
+   - Completed cursor-preserving `Slot -> Category -> Scene -> Live Preview` browser (`A/B` switches scenes in category with `[idx/total]` HUD banner + live parameter/worker reload, `C` confirms for slot and returns to `Scene Slots`, `D` returns to `Scene List` without saving, and all scene `A/B/C/D` overrides/prompts are suppressed during preview).
