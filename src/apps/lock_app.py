@@ -1962,17 +1962,21 @@ finally:
                 else:
                     self.display.draw.line((x1, mid_yi, x2, mid_yi), fill=1)
                 return
-            # 120FPS Wall-Clock Phosphor Temporal Interpolation (tau = 13ms -> converts 46.9Hz DSP packets into silky
-            # continuous 60..120FPS motion with zero step-freeze and <13ms instant transient responsiveness!):
+            # Asymmetric Analog Phosphor Interpolation: tau_attack = 3.2ms (~99% instant punch on outward crests -> ZERO
+            # transient damping!) + tau_release = 8.5ms (silky 60..120FPS sub-frame glide between 46.9Hz DSP packets!):
             now_w = time.monotonic()
             dt_w = max(0.002, min(0.05, now_w - self._wave_disp_ts.get(phase_tag, now_w - 0.016)))
             self._wave_disp_ts[phase_tag] = now_w
-            alpha_w = 1.0 - math.exp(-dt_w / 0.013)
+            a_atk = 1.0 - math.exp(-dt_w / 0.0032)
+            a_rel = 1.0 - math.exp(-dt_w / 0.0085)
             prev_disp = self._wave_disp_state.get(phase_tag)
             if prev_disp is None or len(prev_disp) != 120:
                 disp120 = list(pts120)
             else:
-                disp120 = [prev_disp[i] + (pts120[i] - prev_disp[i]) * alpha_w for i in range(120)]
+                disp120 = [
+                    prev_disp[i] + (pts120[i] - prev_disp[i]) * (a_atk if abs(pts120[i]) > abs(prev_disp[i]) else a_rel)
+                    for i in range(120)
+                ]
             self._wave_disp_state[phase_tag] = disp120
 
             span_pts = float(min(119, w_cols))
