@@ -146,7 +146,8 @@ class Display:
         except Exception:
             pass
         self._pwm_base_dt = init_dt
-        self._shm[0:36] = struct.pack("<IIIIIIdI", 0, 0, 0, 0, 0, 0, init_dt, 144)
+        # Comment (invariant): shm[32:36] is reserved for Display's I2C0 pin-reset counter (rcnt) watched by UIManager._check_and_heal_pcm5122(); store adaptive Hybrid PWM byte budget in shm[36:40] so budget updates never trigger false 18..132ms PCM5122 re-latch stalls.
+        self._shm[0:40] = struct.pack("<IIIIIIdII", 0, 0, 0, 0, 0, 0, init_dt, 0, 144)
         self._shm_write_slot = 0
         try:
             os.sched_setaffinity(0, {0, 2, 3})
@@ -807,7 +808,7 @@ class Display:
                             bud = max(48, min(1024, (raw_bud // 8) * 8))
                             self._adapt_pwm_budget = bud
                             if shm is not None:
-                                shm[32:36] = struct.pack("<I", bud)
+                                shm[36:40] = struct.pack("<I", bud)
 
                         if not hasattr(self, "_diag_win_t0"):
                             self._diag_win_t0 = t_done
@@ -1135,12 +1136,12 @@ class Display:
             i_lo = ImageOps.invert(lo_copy.convert("L")).convert("1") if self.invert_mode else lo_copy
             c_ph1 = self._compile_page_buffers(i_ph1, c_hi)
             c_lo = self._compile_page_buffers(i_lo, c_ph1)
-            # Comment (invariant): Enforce the closed-loop hardware-adaptive Hybrid PWM-vs-Dither budget (read from shm[32:36], updated by OLED_Compositor from measured io+prep+lock headroom vs oled_pwm_dt) directly on exact SH1106 vertical-page XOR bytes so any board/bus stays at 0 overruns.
+            # Comment (invariant): Enforce the closed-loop hardware-adaptive Hybrid PWM-vs-Dither budget (read from shm[36:40], updated by OLED_Compositor from measured io+prep+lock headroom vs oled_pwm_dt) directly on exact SH1106 vertical-page XOR bytes so any board/bus stays at 0 overruns.
             _force_pwm = getattr(self, "_gray_force_pwm", False)
             self._gray_force_pwm = False
             if gray_planes and not _force_pwm and getattr(self, "gray_mode", "hybrid") == "hybrid" and hasattr(self, "_apply_dither_img"):
                 _shm_b = getattr(self, "_shm", None)
-                pwm_budget = struct.unpack("<I", _shm_b[32:36])[0] if (_shm_b is not None and len(_shm_b) >= 36) else 144
+                pwm_budget = struct.unpack("<I", _shm_b[36:40])[0] if (_shm_b is not None and len(_shm_b) >= 40) else 144
                 if not (48 <= pwm_budget <= 1024):
                     pwm_budget = 144
                 p_costs = []
