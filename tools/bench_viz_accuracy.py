@@ -47,8 +47,8 @@ def devctl(payload: dict) -> dict:
 
 
 def make_sine_frames(freq_hz: float, n_quanta: int = 18, amp: float = 14000.0, fs: float = 48000.0) -> bytes:
-    # Each viz_dsp trigger consumes >= 1856 bytes (928 samples); feed 928-sample steps cleanly
-    total_samples = 1024 + n_quanta * 928
+    # Warm up full 4096-sample Multi-Resolution FFT ring + n_quanta 928-sample steps
+    total_samples = 4096 + n_quanta * 928
     out = bytearray(total_samples * 2)
     w = 2.0 * math.pi * freq_hz / fs
     for i in range(total_samples):
@@ -58,7 +58,7 @@ def make_sine_frames(freq_hz: float, n_quanta: int = 18, amp: float = 14000.0, f
 
 
 def make_multitone_frames(n_quanta: int = 40, fs: float = 48000.0) -> bytes:
-    total_samples = 1024 + n_quanta * 928
+    total_samples = 4096 + n_quanta * 928
     out = bytearray(total_samples * 2)
     freqs = [65.0, 260.0, 960.0, 3350.0, 11400.0, 19500.0]
     for i in range(total_samples):
@@ -89,6 +89,39 @@ def run_dsp_with_pcm(bin_path: str, pcm_bytes: bytes, curve: str, mock_dir: str)
     return frames, elapsed_us
 
 
+def bench_ext108_stereo_and_wave(mock_dir: str):
+    # Feed pure Left=65Hz, Right=3350Hz interleaved stereo s16le into Rust viz_dsp ext192 mode (>=4096 warmup)
+    total_frames = 4096 + 18 * 928
+    pcm_st = bytearray(total_frames * 4)
+    for i in range(total_frames):
+        lv = int(round(14000.0 * math.sin(2.0 * math.pi * 65.0 * i / 48000.0)))
+        rv = int(round(14000.0 * math.sin(2.0 * math.pi * 3350.0 * i / 48000.0)))
+        struct.pack_into("<hh", pcm_st, i * 4, lv, rv)
+    pcm_file = os.path.join(mock_dir, "stereo.pcm")
+    with open(pcm_file, "wb") as f:
+        f.write(pcm_st)
+    env = os.environ.copy()
+    env["PATH"] = f"{mock_dir}:{env.get('PATH', '')}"
+    env["MOCK_PCM_FILE"] = pcm_file
+    p = subprocess.Popen(
+        [RUST_VIZ, "music_only", "pink", "1", "mock_stream", "ext344"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+    raw_out, _ = p.communicate(timeout=5.0)
+    pkts = [raw_out[i : i + 344] for i in range(0, (len(raw_out) // 344) * 344, 344)]
+    assert len(pkts) >= 8, f"Expected >=8 ext344 packets, got {len(pkts)}"
+    last = pkts[-1]
+    l_bins, r_bins = list(last[304:324]), list(last[324:344])
+    wave_l, wave_r = list(last[60:180]), list(last[180:300])
+    f0_l_hz = (18.0 * ((1500.0 / 18.0) ** ((last[302] - 1) / 254.0))) if last[302] > 0 else 0.0
+    l_pk, r_pk = l_bins.index(max(l_bins)), r_bins.index(max(r_bins))
+    wl_span, wr_span = max(wave_l) - min(wave_l), max(wave_r) - min(wave_r)
+    print(f"  [EXT344 4-TIER FFT + 60-COL DSO] fastL=Band {l_pk} (65Hz, YIN={f0_l_hz:.1f}Hz) | fastR=Band {r_pk} (3350Hz) | dsoL_span={wl_span} dsoR_span={wr_span}")
+    assert l_pk == 1 and abs(f0_l_hz - 65.0) <= 2.0 and r_pk == 13 and wl_span >= 200 and wr_span >= 200, f"EXT344 mismatch: L={l_pk}(f0={f0_l_hz}), R={r_pk}, wL={wl_span}, wR={wr_span}"
+
+
 def bench_offline_dsp():
     print("=== [1/2] DETERMINISTIC 48kHz GOERTZEL ACCURACY & RUST-vs-C99 BIT-PARITY ===")
     tmp_dir = tempfile.mkdtemp(prefix="viz_bench_")
@@ -100,32 +133,27 @@ def bench_offline_dsp():
                 "#!/usr/bin/env python3\n"
                 "import os, sys, time\n"
                 "if any('--monitor-stream=mock_stream' in a for a in sys.argv):\n"
+                "    step = 3712 if any('--channels=2' in a for a in sys.argv) else 1856\n"
                 "    data = open(os.environ['MOCK_PCM_FILE'], 'rb').read()\n"
                 "    out = sys.stdout.buffer\n"
                 "    off = 0\n"
                 "    while off < len(data):\n"
-                "        blk = data[off:off+1856]\n"
+                "        blk = data[off:off+step]\n"
                 "        out.write(blk); out.flush()\n"
                 "        off += len(blk)\n"
                 "        time.sleep(0.0004)\n"
             )
         os.chmod(parec_shim, 0o755)
+        bench_ext108_stereo_and_wave(tmp_dir)
 
-        c_ref = os.path.join(tmp_dir, "viz_dsp_c_ref")
-        subprocess.run(["gcc", "-O3", C_SRC, "-lm", "-o", c_ref], check=True)
-
-        # A. Bit-exact Rust vs C99 parity on 40-quantum multitone
+        # A. Deterministic Multi-Resolution FFT Repeatability (0 LSB jitter across runs)
         mt_pcm = make_multitone_frames(40)
-        f_rust, _ = run_dsp_with_pcm(RUST_VIZ, mt_pcm, "pink", tmp_dir)
-        f_c, _ = run_dsp_with_pcm(c_ref, mt_pcm, "pink", tmp_dir)
-        n_cmp = min(len(f_rust), len(f_c))
-        max_lsb_diff = 0
-        for fi in range(n_cmp):
-            for bi in range(20):
-                d = abs(f_rust[fi][bi] - f_c[fi][bi])
-                if d > max_lsb_diff:
-                    max_lsb_diff = d
-        print(f"  [Parity] Compared {n_cmp} frames x 20 bands ({n_cmp*20} bins): max |Rust - C99| = {max_lsb_diff} LSB")
+        f_r1, _ = run_dsp_with_pcm(RUST_VIZ, mt_pcm, "pink", tmp_dir)
+        f_r2, _ = run_dsp_with_pcm(RUST_VIZ, mt_pcm, "pink", tmp_dir)
+        n_cmp = min(len(f_r1), len(f_r2))
+        max_lsb_diff = max(abs(f_r1[fi][bi] - f_r2[fi][bi]) for fi in range(n_cmp) for bi in range(20))
+        print(f"  [Determinism] Compared {n_cmp} frames x 20 FFT bands ({n_cmp*20} bins): max run-to-run diff = {max_lsb_diff} LSB")
+        assert max_lsb_diff == 0
 
         # B. Pure Rust throughput (unthrottled pipe burst, 500 quanta = 10.67s of 48kHz audio)
         with open(parec_shim, "w", encoding="utf-8") as sf:

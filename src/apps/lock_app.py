@@ -62,12 +62,22 @@ class LockScreenApp(BaseApp):
         self.scope_view = 0
         self.scope_stride = 1
 
-        # Real-Time 16kHz Audio Visualizer state (Core 0,1 isolated, zero-clash with Core 3 RT audio)
+        # Real-Time 48kHz Rust Audio Visualizer state (True-Stereo + Phase-Locked Waveform + Sine-Pulse Envelopes)
         self._viz_running = False
         self._viz_thread = None
         self._viz_proc = None
         self._viz_source = None
-        self.viz_bins = [0.08] * 20
+        self.viz_bins = [0.05] * 20
+        self.viz_bins_l = [0.05] * 20
+        self.viz_bins_r = [0.05] * 20
+        self.viz_wave = [0.0] * 44
+        self.viz_wave_l = [0.0] * 44
+        self.viz_wave_r = [0.0] * 44
+        self.viz_fast_m = [0.0] * 20
+        self.viz_fast_l = [0.0] * 20
+        self.viz_fast_r = [0.0] * 20
+        self.viz_env = (0.05, 0.05, 0.05, 0.0)
+        self.viz_fullscreen = False
 
         # Dual-Mic & Ultrasonic state
         self.usonic_view = 0
@@ -219,6 +229,122 @@ class LockScreenApp(BaseApp):
             except ValueError:
                 pass
         return int(self.ui.db.get_setting("lock_ambient_idle_sec", "30"))
+
+    # Stage: Single-Source Visualizer Configuration, Hotkey Controller & Viewport Engine (Zero duplicated scene code)
+    VIZ_MODES = ("mono", "stereo", "sine_wave", "stereo_wave")
+    VIZ_MODE_LABELS = {
+        "mono": "Mono RTA",
+        "stereo": "Stereo L|R",
+        "sine_wave": "Sine Wave",
+        "stereo_wave": "Stereo Wave",
+    }
+    VIZ_BAND_OPTS = (20, 16, 12, 10, 8, 5)
+
+    def get_effective_viz_mode(self, scene_id: str) -> str:
+        ov = self.ui.db.get_setting(f"scene_stereo_{scene_id}", "global")
+        if ov in self.VIZ_MODES:
+            return ov
+        g_mode = self.ui.db.get_setting("lock_viz_stereo", "mono")
+        return g_mode if g_mode in self.VIZ_MODES else "mono"
+
+    def get_effective_viz_bands(self, scene_id: str) -> int:
+        ov = self.ui.db.get_setting(f"scene_bands_{scene_id}", "global")
+        raw = ov if ov != "global" else self.ui.db.get_setting("lock_viz_bands", "20")
+        try:
+            val = int(raw)
+        except ValueError:
+            val = 20
+        return val if val in self.VIZ_BAND_OPTS else 20
+
+    def handle_visualizer_hotkeys(self, scene_id: str, action: str, key: str, allow_fullscreen: bool = True) -> bool:
+        """
+        Centralized live visualizer customization hotkeys shared by all music/visualizer scenes:
+- CLICK '0': Cycle Mode (Mono RTA -> Stereo L|R -> Sine Wave -> Stereo Wave)
+        - CLICK 'C': Toggle 100% Fullscreen 128x64 Visualizer Canvas (hides text/HUD edge-to-edge)
+        - CLICK '3': Cycle Band / Harmonic Count (20 -> 16 -> 12 -> 10 -> 8 -> 5)
+        - HOLD  '0': Cycle Bar / Wave Style (Solid -> LED -> PWM Shaded -> Hollow)
+        - HOLD  '3': Cycle Peak / Pulse Physics (Zero-G Float -> Feather -> Studio -> Heavy -> Caps Off)
+        - HOLD  '1': Toggle Spectrum Curve (Pink +3dB <-> Raw 0dB RTA)
+        """
+        db = self.ui.db
+        if action == "CLICK":
+            if key == "0":
+                cur = self.get_effective_viz_mode(scene_id)
+                nxt = self.VIZ_MODES[(self.VIZ_MODES.index(cur) + 1) % len(self.VIZ_MODES)]
+                if db.get_setting(f"scene_stereo_{scene_id}", "global") in self.VIZ_MODES:
+                    db.set_setting(f"scene_stereo_{scene_id}", nxt)
+                else:
+                    db.set_setting("lock_viz_stereo", nxt)
+                self._viz_cfg_ts = 0.0
+                self.ui.show_toast(f"Viz: {self.VIZ_MODE_LABELS[nxt]}", duration=1.25)
+                return True
+            if key == "C" and allow_fullscreen and self.standalone_scene is None:
+                self.viz_fullscreen = not self.viz_fullscreen
+                self._latched_geom_key = None
+                self.ui.show_toast("Viz: Fullscreen" if self.viz_fullscreen else "Viz: HUD View", duration=1.15)
+                return True
+            if key == "3":
+                cur_b = self.get_effective_viz_bands(scene_id)
+                nxt_b = self.VIZ_BAND_OPTS[(self.VIZ_BAND_OPTS.index(cur_b) + 1) % len(self.VIZ_BAND_OPTS)]
+                if db.get_setting(f"scene_bands_{scene_id}", "global") != "global":
+                    db.set_setting(f"scene_bands_{scene_id}", str(nxt_b))
+                else:
+                    db.set_setting("lock_viz_bands", str(nxt_b))
+                self._viz_cfg_ts = 0.0
+                self._latched_geom_key = None
+                mode_now = self.get_effective_viz_mode(scene_id)
+                unit = "Harmonics" if "wave" in mode_now else "Bands"
+                self.ui.show_toast(f"{unit}: {nxt_b}", duration=1.15)
+                return True
+        elif action == "HOLD":
+            if key == "0":
+                styles = ("solid", "led", "shaded", "hollow")
+                s_lbls = {"solid": "Solid", "led": "LED Seg", "shaded": "PWM Gray", "hollow": "Hollow/Dual"}
+                cur_s = self._get_effective_bar_style(scene_id)
+                nxt_s = styles[(styles.index(cur_s) + 1) % len(styles)] if cur_s in styles else "solid"
+                if db.get_setting(f"scene_bar_{scene_id}", "global") in styles:
+                    db.set_setting(f"scene_bar_{scene_id}", nxt_s)
+                else:
+                    db.set_setting("lock_viz_bar_style", nxt_s)
+                self._viz_cfg_ts = 0.0
+                self.ui.show_toast(f"Style: {s_lbls[nxt_s]}", duration=1.25)
+                return True
+            if key == "3":
+                mode_now = self.get_effective_viz_mode(scene_id)
+                if "wave" in mode_now:
+                    cur_sc = db.get_setting("lock_viz_scope_algo", "triggered_pcm")
+                    nxt_sc = "pitch_silk" if cur_sc == "triggered_pcm" else "triggered_pcm"
+                    db.set_setting("lock_viz_scope_algo", nxt_sc)
+                    self._viz_cfg_ts = 0.0
+                    lbl_sc = "Triggered PCM" if nxt_sc == "triggered_pcm" else "Pitch Silk"
+                    self.ui.show_toast(f"Scope: {lbl_sc}", duration=1.35)
+                    return True
+                presets = ("float", "feather", "studio", "heavy", "off")
+                p_lbls = {"float": "Zero-G", "feather": "Feather", "studio": "Studio", "heavy": "Heavy", "off": "Caps Off"}
+                cur_cap = self._get_effective_cap_style(scene_id)
+                cur_pr = db.get_setting("lock_viz_preset", "float")
+                cur_key = "off" if cur_cap == "off" else (cur_pr if cur_pr in presets else "float")
+                nxt_p = presets[(presets.index(cur_key) + 1) % len(presets)]
+                if nxt_p == "off":
+                    db.set_setting("lock_viz_cap_style", "off")
+                else:
+                    if cur_cap == "off":
+                        db.set_setting("lock_viz_cap_style", "pwm")
+                    db.set_setting("lock_viz_preset", nxt_p)
+                self._viz_cfg_ts = 0.0
+                self.ui.show_toast(f"Peak: {p_lbls[nxt_p]}", duration=1.25)
+                return True
+            if key == "1":
+                cur_c = self._get_effective_viz_curve(scene_id)
+                nxt_c = "raw" if cur_c == "pink" else "pink"
+                if db.get_setting(f"scene_curve_{scene_id}", "global") in ("pink", "raw"):
+                    db.set_setting(f"scene_curve_{scene_id}", nxt_c)
+                else:
+                    db.set_setting("lock_viz_curve", nxt_c)
+                self._viz_cfg_ts = 0.0
+                self.ui.show_toast("EQ: Pink +3dB" if nxt_c == "pink" else "EQ: Raw 0dB", duration=1.25)
+                return True
+        return False
 
     def _get_effective_viz_curve(self, scene_id: str) -> str:
         """Resolves per-scene or global spectrum weighting curve: 'pink' (+3dB/oct Pink-Noise flat ★) or 'raw' (0dB linear RTA)."""
@@ -464,11 +590,13 @@ class LockScreenApp(BaseApp):
         # 1. GIL-Free 48kHz (45Hz-20kHz) Audio Visualizer Subprocess:
         #    Includes live amb_flag in target_mode so toggling AMB immediately updates stream isolation!
         viz_scenes = {"music_split", "music_viz", "ambient_hud", "amb_music_hybrid"}
+        if self.viz_fullscreen and scene_id == "music_classic":
+            viz_scenes.add("music_classic")
         if awake and scene_id in viz_scenes:
             is_play = self._get_media_playing()
             is_amb = "1" if getattr(self.ui, "transparency_enabled", False) else "0"
             curve_m = self._get_effective_viz_curve(scene_id)
-            if scene_id in ("music_split", "music_viz"):
+            if scene_id in ("music_split", "music_viz", "music_classic"):
                 want_viz = is_play
                 target_mode = f"music_only:{curve_m}:{is_amb}"
             elif scene_id == "ambient_hud":
@@ -792,31 +920,79 @@ try:
 finally:
     _clean_exit(0, None)
 """
-        # Comment (invariant): Never pass `0,1` (Core 1 is isolated for nice(-20) OLED_Compositor, DP-495) and never cram onto single Core `0` alone (HR-503); prefer precompiled native C `bin/viz_dsp` (<0.5% CPU, zero GC) on Cores `0,2` with automatic Python fallback.
+        # Comment (invariant): Never pass `0,1` (Core 1 is isolated for nice(-20) OLED_Compositor, DP-495) and never cram onto single Core `0` alone on 4-core H618 (HR-503); read dsp_cores from hw_profile (`0,2` on 4-core boards, `0` only on 1/2-core boards) and prefer native Rust `bin/viz_dsp` (<0.5% CPU, zero GC).
+        dsp_cores = str(getattr(self.ui, "hw_profile", {}).get("dsp_cores", "0,2" if (os.cpu_count() or 1) >= 4 else "0"))
         native_bin = "/home/vipxpert/vipxpert_minimal_os/bin/viz_dsp"
-        if os.path.isfile(native_bin) and os.access(native_bin, os.X_OK):
+        use_ext344 = os.path.isfile(native_bin) and os.access(native_bin, os.X_OK)
+        if use_ext344:
             cmd = [
-                "taskset", "-c", "0,2",
+                "taskset", "-c", dsp_cores,
                 "runuser", "-u", "vipxpert", "--", "env", "XDG_RUNTIME_DIR=/run/user/1000",
-                native_bin, viz_mode, curve_mode, amb_on, stream_idx
+                native_bin, viz_mode, curve_mode, amb_on, stream_idx, "ext344"
             ]
+            pkt_len = 344
         else:
             cmd = [
-                "taskset", "-c", "0,2",
+                "taskset", "-c", dsp_cores,
                 "runuser", "-u", "vipxpert", "--", "env", "XDG_RUNTIME_DIR=/run/user/1000",
                 sys.executable, "-u", "-c", dsp_code, viz_mode, curve_mode, amb_on, stream_idx
             ]
+            pkt_len = 20
         proc = None
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=20, start_new_session=True)
+            import select as _sel
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, start_new_session=True)
             self._viz_proc = proc
+            p_fd = proc.stdout.fileno()
+
+            def _read_exact(n_req: int) -> bytes:
+                buf = bytearray()
+                while len(buf) < n_req:
+                    ch = os.read(p_fd, n_req - len(buf))
+                    if not ch:
+                        return b""
+                    buf.extend(ch)
+                return bytes(buf)
+
             while self._viz_running and self._viz_source == mode_curve_amb:
                 if getattr(self.ui, "is_screen_off", False):
                     break
-                raw20 = proc.stdout.read(20)
-                if not raw20 or len(raw20) < 20:
+                pkt = _read_exact(pkt_len)
+                if not pkt:
                     break
-                self.viz_bins = [b / 255.0 for b in raw20]
+                # Drain any queued complete packets so UI always latches the freshest 0.0ms real-time audio frame!
+                while _sel.select([p_fd], [], [], 0.0)[0]:
+                    newer = _read_exact(pkt_len)
+                    if not newer:
+                        break
+                    pkt = newer
+                self.viz_bins = [b / 255.0 for b in pkt[0:20]]
+                if pkt_len == 344:
+                    self.viz_bins_l = [b / 255.0 for b in pkt[20:40]]
+                    self.viz_bins_r = [b / 255.0 for b in pkt[40:60]]
+                    wl = [(b - 128) / 124.0 for b in pkt[60:180]]
+                    wr = [(b - 128) / 124.0 for b in pkt[180:300]]
+                    wm = [(wl[k] + wr[k]) * 0.5 for k in range(120)]
+                    fl = [b / 255.0 for b in pkt[304:324]]
+                    fr = [b / 255.0 for b in pkt[324:344]]
+                    self.viz_wave_l = wl
+                    self.viz_wave_r = wr
+                    self.viz_wave = wm
+                    self.viz_fast_l = fl
+                    self.viz_fast_r = fr
+                    self.viz_fast_m = [max(fl[i], fr[i]) for i in range(20)]
+                    f0_l = (18.0 * ((1500.0 / 18.0) ** ((pkt[302] - 1) / 254.0))) if pkt[302] > 0 else 0.0
+                    f0_r = (18.0 * ((1500.0 / 18.0) ** ((pkt[303] - 1) / 254.0))) if pkt[303] > 0 else 0.0
+                    self.viz_f0_l = f0_l
+                    self.viz_f0_r = f0_r
+                    self.viz_f0_m = f0_l if (f0_l > 0.0 and (f0_r <= 0.0 or max(fl) >= max(fr))) else f0_r
+                    self.viz_env = (pkt[300] / 255.0, pkt[301] / 255.0, pkt[302] / 255.0, pkt[303] / 255.0)
+                else:
+                    self.viz_bins_l = self.viz_bins
+                    self.viz_bins_r = self.viz_bins
+                    self.viz_fast_m = [max(0.0, b - 0.05) for b in self.viz_bins]
+                    self.viz_fast_l = self.viz_fast_m
+                    self.viz_fast_r = self.viz_fast_m
         except Exception:
             pass
         finally:
@@ -1226,10 +1402,13 @@ finally:
             self.cube_auto = not self.cube_auto
         elif key == "1" and action == "CLICK":
             self.cube_mesh = (self.cube_mesh + 1) % 2
+            self.ui.show_toast("Mesh: Octahedron" if self.cube_mesh == 1 else "Mesh: Cube", duration=1.1)
         elif key == "3" and action == "CLICK":
             modes = ["off", "pwm", "spatial", "temporal"]
             cur = getattr(self.display, "dither_mode", "off")
-            self.display.dither_mode = modes[(modes.index(cur) + 1) % len(modes)] if cur in modes else "pwm"
+            nxt_d = modes[(modes.index(cur) + 1) % len(modes)] if cur in modes else "pwm"
+            self.display.dither_mode = nxt_d
+            self.ui.show_toast(f"Shade: {nxt_d.upper()}", duration=1.1)
         elif key == "7":
             self.cube_scale = max(10.0, self.cube_scale - 2.0)
         elif key == "9":
@@ -1426,11 +1605,17 @@ finally:
             return
 
         if self.standalone_scene is not None:
-            # Stage: Preview Navigation & A/B/C/D Scene-Override Guard (Locks A/B=Switch, C=Confirm, D=Back on preview screen)
-            # Comment (invariant): Never pass keys A, B, C, or D down to plugin.handle_key() while standalone_scene preview is active, so scenes that override D or A/B/C cannot trap the user in preview mode.
+            # Stage: Preview Navigation & A/B/C/D Scene-Override Guard (Locks CLICK C=Save/HUD, CLICK D=Cancel/Back, CLICK A/B=Switch; allows HOLD C Fullscreen test)
+            # Comment (invariant): Never pass CLICK A, B, C, or D down to plugin.handle_key() while standalone_scene preview is active, so scenes using C (Fullscreen) or D (MV toggle) never conflict with C=Confirm/Save or D=Cancel/Back.
             if key in ("A", "B", "C", "D"):
+                if key == "C" and action == "HOLD" and self.standalone_scene in ("music_split", "music_viz", "ambient_hud", "amb_music_hybrid", "music_classic"):
+                    self.viz_fullscreen = not self.viz_fullscreen
+                    self._latched_geom_key_M = None
+                    self.ui.show_toast("Preview: FullScrn" if self.viz_fullscreen else "Preview: HUD View", duration=1.15)
+                    return
                 if action != "CLICK":
                     return
+                self.viz_fullscreen = False
                 parent_app = self.ui.active_apps.get(self.parent_app_id) if self.parent_app_id else None
                 if key == "D" and self.parent_app_id:
                     if parent_app and getattr(parent_app, "current_menu", "") == "lock_cat_scenes" and self.category_scenes:
@@ -1488,6 +1673,7 @@ finally:
                 return
         else:
             if action == "CLICK" and key in ("A", "B"):
+                self.viz_fullscreen = False
                 self.last_slot_input = now
                 slots = self._get_enabled_slots()
                 if len(slots) > 1:
@@ -1503,14 +1689,20 @@ finally:
                 self._trigger_banner_intro(hash_step=0)
                 await self.update()
                 return
-            # Stage: Key D MV/HUD Toggle (Switches between Music Video and Music HUD and suppresses auto-MV for the session)
-            if action == "CLICK" and key == "D" and self.active_slot in ("music", "amb_music"):
-                self._mv_suppressed = not getattr(self, "_mv_suppressed", False)
-                self._sc_id_ts = 0.0
-                self._manual_hud_peek = False
-                self._guide_tuck_deadline = 0.0
-                await self.update()
-                return
+            # Stage: Key D Exit-Fullscreen / MV-HUD Toggle (Exits Fullscreen Visualizer first if active; otherwise toggles MV/HUD)
+            if action == "CLICK" and key == "D":
+                if self.viz_fullscreen:
+                    self.viz_fullscreen = False
+                    self.ui.show_toast("Viz: HUD View", duration=1.1)
+                    await self.update()
+                    return
+                if self.active_slot in ("music", "amb_music"):
+                    self._mv_suppressed = not getattr(self, "_mv_suppressed", False)
+                    self._sc_id_ts = 0.0
+                    self._manual_hud_peek = False
+                    self._guide_tuck_deadline = 0.0
+                    await self.update()
+                    return
 
         scene_id = self._get_active_scene_id()
         # Smart 2.5s Post-Interaction Guide Auto-Tuck:
@@ -1669,22 +1861,200 @@ finally:
         self._cached_media_info = (status_str, title_str, artist_str, pos, dur, codec_str, bt_str)
         return self._cached_media_info
 
-    def _draw_spectrum_bars(self, x1: int, y_top: int, x2: int, y_bot: int, active: bool, bars: int = 16):
+    def render_visualizer_viewport(self, x1: int, y_top: int, x2: int, y_bot: int, active: bool, max_bars: int = 20) -> bool:
+        """
+        Single-source DRY visualizer viewport renderer for all scenes.
+        Expands to full 128x64 canvas (2..125, 2..61) whenever `self.viz_fullscreen` is active,
+        and promotes Display.show() to 8-page `shm_pwm=2` so particles in Pages 0,1,6,7 (left/right edges) never vanish.
+        """
+        sc_id = self._get_active_scene_id()
+        is_fs = bool(self.viz_fullscreen)
+        if is_fs:
+            x1, y_top, x2, y_bot = 2, 2, 125, 61
+            max_bars = 20
+
+        mode = self.get_effective_viz_mode(sc_id)
+        cfg_bands = min(max_bars, self.get_effective_viz_bands(sc_id))
+
+        if mode == "stereo_wave":
+            mid_x = (x1 + x2) // 2
+            half_harm = max(5, cfg_bands // 2)
+            self._draw_sine_visualizer(x1, y_top, mid_x - 2, y_bot, active, harmonics=half_harm, bins_src=self.viz_fast_l, wave_src=self.viz_wave_l, phase_tag="L")
+            self.display.draw.line((mid_x, y_top, mid_x, y_bot), fill=1)
+            self._draw_sine_visualizer(mid_x + 3, y_top, x2, y_bot, active, harmonics=half_harm, bins_src=self.viz_fast_r, wave_src=self.viz_wave_r, phase_tag="R")
+        elif mode == "sine_wave":
+            self._draw_sine_visualizer(x1, y_top, x2, y_bot, active, harmonics=cfg_bands, bins_src=self.viz_fast_m, wave_src=self.viz_wave, phase_tag="M")
+        elif mode == "stereo":
+            half_bars = max(3, cfg_bands // 2)
+            mid_x = (x1 + x2) // 2
+            self._draw_spectrum_bars(x1, y_top, mid_x - 2, y_bot, active, bars=half_bars, bins_override=self.viz_bins_l, chan_key="L")
+            self.display.draw.line((mid_x, y_top, mid_x, y_bot), fill=1)
+            self._draw_spectrum_bars(mid_x + 3, y_top, x2, y_bot, active, bars=half_bars, bins_override=self.viz_bins_r, chan_key="R")
+        else:
+            self._draw_spectrum_bars(x1, y_top, x2, y_bot, active, bars=cfg_bands)
+
+        # Comment (invariant): Display._flush_precompiled_pages skips OLED Pages 0, 1, 6, 7 during ph0/ph1 when shm_pwm==1 (optimized for y=16..47 HUD viewports), which erases PWM gray particles on quiet outer left/right bars (y=48..61) and tall apexes (y=2..15) in Fullscreen; seeding _pwm_gray_planes promotes Display.show() to 8-page shm_pwm=2 while still applying _pwm_rects shades onto ph1/lo.
+        if is_fs and getattr(self.display, "_pwm_rects", None) and getattr(self.display, "_pwm_gray_planes", None) is None:
+            base_copy = self.display.image.copy()
+            self.display._pwm_gray_planes = (base_copy, base_copy.copy(), ("fs_viz", getattr(self.display, "_frame_seq", 0), tuple(self.display._pwm_rects)))
+        return is_fs
+
+    def _draw_sine_visualizer(self, x1: int, y_top: int, x2: int, y_bot: int, active: bool, harmonics: int = 16, bins_src=None, wave_src=None, phase_tag: str = "M"):
+        """
+        Renders live HOLD-'3' A/B-selectable standard oscilloscope modes (proven in CR-668):
+          - 'triggered_pcm' ★: Corrscope low-pass correlation-triggered real-PCM waveform (44 pts over 36.7ms/73.3ms)
+          - 'pitch_silk':      YIN autocorrelation fundamental pitch f0 silky wave + real HF shimmer
+        """
         sc_id = self._get_active_scene_id()
         show_live = (active or sc_id in ("ambient_hud", "amb_music_hybrid")) and self._viz_running
-        live_bins = getattr(self, "viz_bins", None) or [0.05] * 20
-        peaks = getattr(self, "viz_peaks", None)
-        peak_holds = getattr(self, "viz_peak_holds", None)
-        fall_ticks = getattr(self, "viz_fall_ticks", None)
+        ph, _ = self.advance_scene_phase(f"viz_sine_wave_{phase_tag}", ref_fps=30.0)
+        bins20 = list(bins_src if bins_src is not None else getattr(self, "viz_fast_m", self.viz_bins))
+        if len(bins20) < 20:
+            bins20 = [0.0] * 20
+        w_raw = list(wave_src if wave_src is not None else getattr(self, "viz_wave", [0.0] * 120))
+        pts120 = [(float(p[1]) if isinstance(p, tuple) else float(p)) for p in w_raw]
+        if len(pts120) < 120:
+            pts120 = [0.0] * 120
+        bar_style = self._get_effective_bar_style(sc_id)
+        scope_algo = self.ui.db.get_setting("lock_viz_scope_algo", "triggered_pcm")
+
+        # Comment (invariant): Crisp 1px-Thin 120-Point Triggered Oscilloscope (proven in CR-737, N008 + N005): NEVER draw vertical (lo..hi) filled bars per column (which turns hi-hats/12kHz into a thick solid white block!); draw a single 1px polyline over 120 native unaltered 0dB points (splitting >6px jumps across px-1/px so steep HF edges stay airy 1px lines with zero 12kHz pulsing!).
+        mid_y = (y_top + y_bot) * 0.5
+        half_h = max(3.0, (y_bot - y_top) * 0.48)
+        w_cols = max(12, int(x2) - int(x1))
+        pk_all = max(bins20) if show_live else 0.0
+        w_span = (max(pts120) - min(pts120)) if show_live else 0.0
+        if show_live or pk_all > 0.02 or w_span > 0.04:
+            self.display.has_active_marquee = True
+
+        if scope_algo == "triggered_pcm":
+            mid_yi = int(round(mid_y))
+            if not show_live or w_span <= 0.02:
+                if bar_style == "led":
+                    for col_i in range(0, w_cols + 1, 2):
+                        self.display.draw.point((x1 + col_i, mid_yi), fill=1)
+                else:
+                    self.display.draw.line((x1, mid_yi, x2, mid_yi), fill=1)
+                return
+            zoom_pts = max(64.0, min(119.0, 119.0 * (16.0 / max(8.0, min(20.0, float(harmonics))))))
+            start_pt = (119.0 - zoom_pts) * 0.5
+            c4_col = (0.0, 1.0, 0.0, -1.0)
+            prev_y = None
+            for col_i in range(w_cols + 1):
+                p0 = start_pt + (col_i / float(w_cols)) * zoom_pts
+                p1 = start_pt + (min(w_cols, col_i + 1) / float(w_cols)) * zoom_pts
+                i0 = min(119, max(0, int(p0)))
+                i1 = min(119, max(i0 + 1, int(p1)))
+                sl = pts120[i0 : i1 + 1]
+                mn_s, mx_s = min(sl), max(sl)
+                if (mx_s - mn_s) > 0.35 and any(
+                    (pts120[j + 1] - pts120[j]) * (pts120[j] - pts120[max(0, j - 1)]) < -0.05
+                    for j in range(max(1, i0), min(118, i1 + 1))
+                ):
+                    sig = 0.5 * (mx_s + mn_s) + 0.5 * (mx_s - mn_s) * c4_col[col_i & 3]
+                else:
+                    idx = min(118, max(0, int(p0)))
+                    frac = p0 - idx
+                    sig = pts120[idx] * (1.0 - frac) + pts120[idx + 1] * frac
+                px = x1 + col_i
+                y_cur = int(round(max(y_top, min(y_bot, mid_y - sig * half_h))))
+                if bar_style == "shaded" and (col_i & 1) == 0:
+                    ya, yb = (y_cur, mid_yi) if y_cur <= mid_yi else (mid_yi, y_cur)
+                    if yb - ya >= 2:
+                        self.display.draw_shaded_rect(px, ya, min(x2, px + 1), yb, shade=0.50, phase_id=col_i)
+                if bar_style == "led":
+                    if (col_i & 1) == 0:
+                        self.display.draw.point((px, y_cur), fill=1)
+                else:
+                    if prev_y is not None:
+                        if abs(y_cur - prev_y) <= 6:
+                            self.display.draw.line((px - 1, prev_y, px, y_cur), fill=1)
+                        else:
+                            ym = (prev_y + y_cur) // 2
+                            self.display.draw.line((px - 1, prev_y, px - 1, ym), fill=1)
+                            self.display.draw.line((px, ym, px, y_cur), fill=1)
+                    else:
+                        self.display.draw.point((px, y_cur), fill=1)
+                prev_y = y_cur
+            return
+
+        raw_vals = []
+        scale = 1.0
+        if not show_live or pk_all <= 0.008:
+            raw_vals = [0.0] * (w_cols + 1)
+        else:
+            f0_attr = "viz_f0_l" if phase_tag == "L" else ("viz_f0_r" if phase_tag == "R" else "viz_f0_m")
+            f0_hz = float(getattr(self, f0_attr, 0.0))
+            h_scale = max(0.75, min(1.15, float(harmonics) / 12.0))
+            max_cyc = max(3.5, min(25.0, (w_cols / 5.2) * h_scale))
+            if f0_hz > 15.0:
+                cyc_f0 = max(0.30, min(max_cyc, f0_hz * 0.0367 * h_scale))
+            elif bins20[0] > 0.10 and max(bins20[2:20]) < 0.05:
+                cyc_f0 = 0.24
+            else:
+                pk_i = bins20.index(pk_all)
+                cyc_f0 = 0.85 + (max_cyc - 0.85) * ((pk_i / 19.0) ** 1.35)
+            hi_e = max(bins20[13:20])
+            amp_env = min(1.0, pk_all * 1.05)
+            two_pi = 2.0 * math.pi
+            for col_i in range(w_cols + 1):
+                u = col_i / float(w_cols)
+                v = math.sin(two_pi * cyc_f0 * u - ph * 0.65)
+                if hi_e > 0.15 and cyc_f0 < max_cyc * 0.65:
+                    v = v * 0.72 + 0.35 * hi_e * math.sin(two_pi * max_cyc * u + ph * 1.1)
+                raw_vals.append(v * amp_env)
+
+        prev_hi = None
+        prev_lo = None
+        mid_yi = int(round(mid_y))
+
+        for col_i, rv in enumerate(raw_vals):
+            px = x1 + col_i
+            sig = max(-1.0, min(1.0, rv * scale))
+            y_up = int(round(max(y_top, min(y_bot, mid_y - sig * half_h))))
+            y_dn = int(round(max(y_top, min(y_bot, mid_y + sig * half_h * 0.62))))
+
+            if bar_style == "shaded" and (col_i & 1) == 0:
+                ya, yb = (y_up, mid_yi) if y_up <= mid_yi else (mid_yi, y_up)
+                if yb - ya >= 2:
+                    self.display.draw_shaded_rect(px, ya, min(x2, px + 1), yb, shade=0.50, phase_id=col_i)
+
+            if bar_style == "led":
+                if (col_i & 1) == 0:
+                    self.display.draw.point((px, y_up), fill=1)
+            else:
+                if prev_hi is not None:
+                    self.display.draw.line((px - 1, prev_hi, px, y_up), fill=1)
+                else:
+                    self.display.draw.point((px, y_up), fill=1)
+                if bar_style in ("hollow", "shaded"):
+                    if prev_lo is not None:
+                        self.display.draw.line((px - 1, prev_lo, px, y_dn), fill=1)
+                    else:
+                        self.display.draw.point((px, y_dn), fill=1)
+            prev_hi = y_up
+            prev_lo = y_dn
+
+    def _draw_spectrum_bars(self, x1: int, y_top: int, x2: int, y_bot: int, active: bool, bars: int = 16, bins_override=None, chan_key: str = "M"):
+        sc_id = self._get_active_scene_id()
+        show_live = (active or sc_id in ("ambient_hud", "amb_music_hybrid")) and self._viz_running
+        live_bins = (bins_override if bins_override is not None else getattr(self, "viz_bins", None)) or [0.05] * 20
+        pk_attr = f"_viz_peaks_{chan_key}"
+        hd_attr = f"_viz_holds_{chan_key}"
+        fl_attr = f"_viz_falls_{chan_key}"
+        peaks = getattr(self, pk_attr, None)
+        peak_holds = getattr(self, hd_attr, None)
+        fall_ticks = getattr(self, fl_attr, None)
         if not peaks or len(peaks) != 20:
             peaks = [0.05] * 20
+            setattr(self, pk_attr, peaks)
             self.viz_peaks = peaks
         if not peak_holds or len(peak_holds) != 20:
-            peak_holds = [0] * 20
-            self.viz_peak_holds = peak_holds
+            peak_holds = [0.0] * 20
+            setattr(self, hd_attr, peak_holds)
         if not fall_ticks or len(fall_ticks) != 20:
-            fall_ticks = [0] * 20
-            self.viz_fall_ticks = fall_ticks
+            fall_ticks = [0.0] * 20
+            setattr(self, fl_attr, fall_ticks)
 
         now_v = time.monotonic()
         # Cache SQLite visualizer style/physics lookups for 0.5s instead of querying SQLite 13 times per frame!
@@ -1709,18 +2079,22 @@ finally:
         else:
             pwm_m_v, hw_tk_v = 0, getattr(self.display, "_frame_seq", 0)
         # Comment (invariant): When 3-phase UI PWM is active (pwm_m_v == 1), Core-1 latches shm_ver strictly at 51.73Hz (pwm_phase == 2, every 19.33ms); stepping bar geometry once per hw_tk_v eliminates 120Hz vs 51.73Hz beat-aliasing on falling bars/caps and skips redundant intermediate 3-plane compilations.
+        tk_attr = f"_last_viz_hw_tk_{chan_key}"
+        lb_attr = f"_latched_viz_bins_{chan_key}"
+        ph_attr = f"_last_viz_phys_t_{chan_key}"
+        phys_dt_ch = now_v - getattr(self, ph_attr, 0.0)
         if pwm_m_v == 1:
-            step_bars_now = (hw_tk_v != getattr(self, "_last_viz_hw_tk", -1)) or not hasattr(self, "_latched_viz_bins")
-            self._last_viz_hw_tk = hw_tk_v
+            step_bars_now = (hw_tk_v != getattr(self, tk_attr, -1)) or not hasattr(self, lb_attr)
+            setattr(self, tk_attr, hw_tk_v)
         else:
-            step_bars_now = (phys_dt >= 0.015) or not hasattr(self, "_latched_viz_bins")
+            step_bars_now = (phys_dt_ch >= 0.015) or not hasattr(self, lb_attr)
         if step_bars_now:
-            dt_sec = max(0.005, min(0.15, phys_dt if phys_dt < 1.0 else 0.0193))
-            self._last_viz_phys_t = now_v
+            dt_sec = max(0.005, min(0.15, phys_dt_ch if phys_dt_ch < 1.0 else 0.0193))
+            setattr(self, ph_attr, now_v)
             dt_ticks = dt_sec * 30.0
         else:
             dt_ticks = 0.0
-            live_bins = self._latched_viz_bins
+            live_bins = getattr(self, lb_attr)
         import os as _os
         if not hasattr(self, "_viz_diag") or _os.path.exists("/tmp/oled_diag_reset_viz"):
             self._viz_diag = []
@@ -1762,9 +2136,11 @@ finally:
         used_w = (bars - 1) * step_x + (bar_w + 1)
         start_x = x1 + max(0, (span_w - used_w) // 2)
         max_h = max(4, y_bot - y_top)
-        geom_key = (x1, y_top, x2, y_bot, bars, show_live)
+        gk_attr = f"_latched_geom_key_{chan_key}"
+        bg_attr = f"_latched_bar_geom_{chan_key}"
+        geom_key = (x1, y_top, x2, y_bot, bars, show_live, chan_key)
 
-        if step_bars_now or getattr(self, "_latched_geom_key", None) != geom_key or not hasattr(self, "_latched_bar_geom"):
+        if step_bars_now or getattr(self, gk_attr, None) != geom_key or not hasattr(self, bg_attr):
             if not show_live:
                 any_high = False
                 decayed = []
@@ -1778,7 +2154,8 @@ finally:
                     if nv > 0.06 or peaks[idx] > 0.065:
                         any_high = True
                     decayed.append(nv)
-                self.viz_bins = decayed
+                if chan_key == "M":
+                    self.viz_bins = decayed
                 live_bins = decayed
                 self._latched_any_high = any_high
             else:
@@ -1797,11 +2174,11 @@ finally:
                             t_norm = min(2.8, fall_ticks[idx] / 25.0)
                             step_d = (v0_drift + (g_coeff * (t_norm ** exp_p) if exp_p > 0.0 else 0.0)) * dt_ticks
                             peaks[idx] = max(v, peaks[idx] - step_d)
-            self._latched_viz_bins = list(live_bins)
-            self._latched_geom_key = geom_key
+            setattr(self, lb_attr, list(live_bins))
+            setattr(self, gk_attr, geom_key)
             n_bins = len(live_bins)
             g_list = []
-            # Comment (invariant): Pool the peak across the contiguous bin slice [b0..b1] for each rendered bar so 9/10/16/18/20-bar layouts never drop bin 19 (16.6..20.4kHz) or skip inter-bar bins.
+            # Comment (invariant): Pool the peak across the contiguous bin slice [b0..b1] for each rendered bar so 5/8/9/10/12/16/18/20-bar layouts never drop bin 19 (16.6..20.4kHz) or skip inter-bar bins.
             for i in range(bars):
                 bx = start_x + i * step_x
                 if bx + bar_w > x2:
@@ -1816,12 +2193,12 @@ finally:
                 pk_h = max(bh, int(round(pk_lvl * max_h)))
                 by0 = max(y_top, y_bot - bh)
                 g_list.append((i, bx, by0, bh, pk_h))
-            self._latched_bar_geom = g_list
+            setattr(self, bg_attr, g_list)
 
         if getattr(self, "_latched_any_high", True):
             self.display.has_active_marquee = True
 
-        for i, bx, by0, bh, pk_h in self._latched_bar_geom:
+        for i, bx, by0, bh, pk_h in getattr(self, bg_attr):
 
             if bar_style == "led":
                 self.display.draw.rectangle((bx, by0, bx + bar_w, y_bot), fill=1)
@@ -1884,9 +2261,9 @@ finally:
         raw_lines = [ln.strip()[:20] for ln in text_s.replace("\n", "|").split("|") if ln.strip()]
         if not raw_lines:
             return
-        lines = raw_lines[:2] if is_guide else raw_lines[:1]
+        lines = raw_lines[:5] if is_guide else raw_lines[:1]
         n_lines = len(lines)
-        pad = 5 if is_guide else 6
+        pad = 4 if is_guide else 6
 
         line_widths = []
         max_w_px = 12
@@ -1917,11 +2294,11 @@ finally:
                 return max(x0 + 3, x1 - pad - lw)
             return x0 + pad
 
-        box_h = 12 if n_lines == 1 else 23
+        box_h = 12 if n_lines == 1 else min(62, 3 + n_lines * 10)
         if pos == "top":
             y_base0, y_base1 = 0, box_h - 1
         else:
-            y_base0, y_base1 = 64 - box_h, 63
+            y_base0, y_base1 = max(0, 64 - box_h), 63
 
         if fx_mode == "curtain":
             y_off = int((1.0 - alpha) * float(box_h))
@@ -2103,19 +2480,21 @@ finally:
 
         # Comment (invariant): Never wipe rows 0..11 or 52..63 on self.display.image when pills are invisible (causes Pages 0,1,6,7 to black out on ph0 while staying lit on ph1/lo in _pwm_gray_planes!); when a pill IS visible on a saver/MV scene, clear the strip across ph1/lo as well before drawing the pill.
         gp = getattr(self.display, "_pwm_gray_planes", None)
+        if is_saver and t_alpha > 0.02:
+            self.display.draw.rectangle((0, 0, 127, 11), fill=0)
+            if gp is not None:
+                from PIL import ImageDraw as _ID
+                _ID.Draw(gp[0]).rectangle((0, 0, 127, 11), fill=0)
+                _ID.Draw(gp[1]).rectangle((0, 0, 127, 11), fill=0)
+        g_lines_cnt = min(5, max(1, len([s for s in guide_s.replace("\n", "|").split("|") if s.strip()])))
+        g_top_y = max(0, 64 - (12 if g_lines_cnt == 1 else min(62, 3 + g_lines_cnt * 10)))
         if is_saver:
-            if t_alpha > 0.02:
-                self.display.draw.rectangle((0, 0, 127, 11), fill=0)
-                if gp is not None:
-                    from PIL import ImageDraw as _ID
-                    _ID.Draw(gp[0]).rectangle((0, 0, 127, 11), fill=0)
-                    _ID.Draw(gp[1]).rectangle((0, 0, 127, 11), fill=0)
             if g_alpha > 0.02:
-                self.display.draw.rectangle((0, 52, 127, 63), fill=0)
+                self.display.draw.rectangle((0, g_top_y, 127, 63), fill=0)
                 if gp is not None:
                     from PIL import ImageDraw as _ID
-                    _ID.Draw(gp[0]).rectangle((0, 52, 127, 63), fill=0)
-                    _ID.Draw(gp[1]).rectangle((0, 52, 127, 63), fill=0)
+                    _ID.Draw(gp[0]).rectangle((0, g_top_y, 127, 63), fill=0)
+                    _ID.Draw(gp[1]).rectangle((0, g_top_y, 127, 63), fill=0)
 
         if t_alpha > 0.02:
             self._draw_pill_with_fx(title_s, "top", t_alpha, anchor_cfg, fx_mode, is_guide=False)
@@ -2127,9 +2506,9 @@ finally:
                 gp[0].paste(band_t, (0, 0))
                 gp[1].paste(band_t, (0, 0))
             if g_alpha > 0.02:
-                band_b = self.display.image.crop((0, 52, 128, 64))
-                gp[0].paste(band_b, (0, 52))
-                gp[1].paste(band_b, (0, 52))
+                band_b = self.display.image.crop((0, g_top_y, 128, 64))
+                gp[0].paste(band_b, (0, g_top_y))
+                gp[1].paste(band_b, (0, g_top_y))
 
 
     def _draw_power_scope(self):
