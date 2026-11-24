@@ -12,13 +12,13 @@
         ├── README.md (Vipxpert Zero OS overview, 4-core architecture, and Banana Pi M4 Zero quick-install guide)
         ├── .gitignore (Vipxpert Zero OS ignore rules for SQLite DB/calibrations, venv, Rust target/, /bin/ binaries, media/MV caches, scratch scripts, and credentials)
         ├── install.py (Idempotent system installer, custom PipeWire/LDAC/mSBC compiler with TP-Link RTL8761B quirks, ADB USB Audio / udev / scrcpy-server v2.7 & native C/Rust worker builder, H618 DT overlay & WirePlumber provisioner)
-        ├── /rust_workers -> Cargo.toml, src/bin/viz_dsp.rs, src/bin/mic_scope_dsp.rs (Zero-dependency ARM64 Rust 48kHz Goertzel RTA & Ultrasonic Heterodyne DSP workers compiled to /bin/)
+        ├── /rust_workers -> Cargo.toml, src/bin/viz_dsp.rs [BandSpec, build_band_specs, fill_hermitian_win, integrate_dual_band, eval_standard_multires_stereo, extract_dso_trace120, yin_detect_f0_code] (ext344 Zero-Delay 2048/1024/512/256 Constant-Q IEC 61260 FFT-RTA & 120-Point 1px Thin-Trace Oscilloscope), src/bin/mic_scope_dsp.rs, src/bin/hw_bench.rs [sysfs read_online_cores + <12ms startup profiler], src/bin/cart_wasm4.rs [wasmi 2.0.2 sandboxed WASM-4 SHM+IPC adapter, zero-stretch Fill/Fit/1:1 scaler, 4-ch PipeWire APU], src/bin/cart_libretro.rs [zero-dep dlopen Libretro SHM+IPC adapter for NES/GB/GBC/GBA with universal RGB->luma zero-stretch scaler & PipeWire audio] (ARM64 Rust real-time workers compiled to /bin/)
         ├── /src/core -> database.py, os_kernel.py, media_arbiter.py (BT/LOCAL/USB Last-Active Takeover & idle-hub UAC latch), sound_manager.py (/sounds/ non-blocking PipeWire event chime manager), viz_dsp.c
-        ├── /tools -> device_control.py, adb_audio_bridge.py, diag_keypad_row1.py, bench_viz_accuracy.py (Deterministic 48kHz Goertzel Rust-vs-C99 bit-parity & live OLED frame-jitter benchmark)
+        ├── /tools -> device_control.py, adb_audio_bridge.py, diag_keypad_row1.py, bench_viz_accuracy.py, repro_wave_invariants.py [radix2_fft, eval_iec_fft_rta, extract_dso_trace120, wave_rms_floor, sim_standard_dsp, render_dso_scope] (Zero-Delay Constant-Q IEC 61260 FFT-RTA & 120-Point 1px Thin-Trace Oscilloscope verification), build_demo_cart.py (Generates bundled 4-shade WASM-4 runner /cartridges/geo_dash.wasm)
         ├── /src/hardware -> power_monitor.py, keypad.py (90Hz Open-Drain 3-pass batch-ioctl 2/3 majority scanner & zero-lag call_soon_threadsafe asyncio.Queue), display.py
         └── /src/ui -> base_app.py, components.py, ui_manager.py, layout.py, scene_manager.py
     ├── tree_core_app.txt (Core system applications: hierarchical Audio/DSP/DAC/Mic settings hub with Ultrasonic Scope launcher, hardware telemetry Dashboard, system Settings & Lock/MV/Hardware Info diagnostics with Field Scopes, Recent task manager, and 5-Slot Priority Lock Screen & modular ScenePlugin host)
-        ├── /src/apps -> audio_settings_app.py, dashboard.py, settings_app.py, recent_app.py, lock_app.py
+        ├── /src/apps -> audio_settings_app.py, cartridge_app.py, dashboard.py, settings_app.py, recent_app.py, lock_app.py
         └── /src/scenes (Categorized Lock Screen ScenePlugin modules & folder bundles)
             ├── /clocks -> clock_digital.py, clock_analog.py
             ├── /music -> music_classic.py, music_split.py, music_viz.py, ambient_hud.py, amb_music_hybrid.py, /bad_apple/scene.py (Universal native-FPS Music Video engine with video_rules.json, 155.18Hz zero-overrun multi-span Pure PWM, and background pre-caching)
@@ -42,4 +42,5 @@
         ├── bug_display_bt_subtle_hiccup.txt (Status: RESOLVED — Simultaneous OLED visualizer/marquee and Bluetooth audio hiccup fixed via 4-core isolation, native DSP worker, hw_tick V-Sync lock, and offline 0x43 park)
         ├── bug_mv_pwm_freeze_flicker.txt (Status: ACTIVE — Live OS 155.2Hz MV PWM sub-frame slips and 1:55 [Errno 110] I2C0 timeout vs zero-slip standalone tuner)
         ├── bug_bt_audio_stop_distortion.txt (Status: RESOLVED — Bluetooth audio drop & PCM5122 I2C0/I2S distortion during Bad Apple MV playback)
-        └── bug_audio_vis_scene_ui.txt (Status: RESOLVED — Dashboard battery/3s I2C0 stutter fixed in CDR-375, all 16 per-scene settings & Category->Scene->Preview browser completed in CDR-385..387, and 40Hz..20.4kHz Goertzel visualizer verified)
+        ├── bug_audio_vis_scene_ui.txt (Status: RESOLVED — Dashboard battery/3s I2C0 stutter fixed in CDR-375, all 16 per-scene settings & Category->Scene->Preview browser completed in CDR-385..387, and 40Hz..20.4kHz Goertzel visualizer verified)
+        └── bug_wave_treble_snappiness.txt (Status: ACTIVE — Isolating 1Hz quadratic/quantization spike, side-edge taper shrinkage, and 20kHz response in repro_wave_invariants.py before production edit)
