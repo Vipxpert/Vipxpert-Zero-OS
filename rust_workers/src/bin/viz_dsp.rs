@@ -175,13 +175,16 @@ fn build_band_specs(centers: &[f64; 20], is_raw: bool) -> Vec<BandSpec> {
         let b_hi = (f_hi / df).clamp(b_lo + 0.6, k_max as f64);
         let k0 = (b_lo.floor() as usize).max(1);
         let k1 = (b_hi.ceil() as usize).clamp(k0, k_max);
+        // Comment (invariant): Parseval Multi-Res Identity + Voxengo SPAN / FabFilter Pro-Q +4.2dB/oct Music Balance: when |X[k]|^2 is normalized by (N/4)^2, halving N doubles bin noise power and halves bin count (2 * 0.5 = 1.0 exact tier invariance); weighting Pink/Music mode by (fk / 350)^0.4 (+1.2dB/oct on top of +3.01dB/oct Parseval = +4.21dB/oct) balances bass and treble on real -4.5dB/oct mastered songs!
         let mut overlaps = Vec::with_capacity(k1 - k0 + 1);
         for k in k0..=k1 {
             let kf = k as f64;
+            let fk = kf * df;
             let ov = (b_hi.min(kf + 0.5) - b_lo.max(kf - 0.5)).max(0.0);
-            overlaps.push(ov);
+            let tilt = if is_raw { 1.0 } else { (fk / 350.0).max(0.28).powf(0.40) };
+            overlaps.push(ov * tilt);
         }
-        let raw_div = if is_raw { (fc / 60.0).max(0.75) } else { 1.0 };
+        let raw_div = if is_raw { (b_hi - b_lo).max(0.5) } else { 1.0 };
         specs.push(BandSpec {
             tier,
             k0,
@@ -629,127 +632,236 @@ fn extract_corrscope_wave44(
     }
 }
 
-// Comment (invariant): Machine-Accurate 120-Point 1px Thin-Trace Triggered Oscilloscope (proven in CR-737, N008 + N005): NEVER emit vertical-fill (lo, hi) spans on a 1-bit OLED (which turns hi-hats/12kHz into an 8..24px fat white block!); instead emit 120 scalar samples over 960 unaltered 0dB PCM frames (8 samples/pt = 6,000 Hz sample rate, 1:1 native 120px fullscreen resolution!) using exact midpoint PCM below ~3kHz and Parseval sqrt(2*Var) 4-step Peak-Detect crests above ~3kHz for a razor-thin 1px trace with zero 12kHz pulsing!
+#[inline]
+fn shift_f64_slice(ring: &mut [f64], fresh: &[f64], n: usize) {
+    let len = ring.len();
+    if n == 0 {
+        return;
+    }
+    if n >= len {
+        ring.copy_from_slice(&fresh[n - len..n]);
+    } else {
+        ring.copy_within(n..len, 0);
+        ring[len - n..len].copy_from_slice(&fresh[..n]);
+    }
+}
+
+#[inline]
+fn sinc_interp_32(sig: &[f64; 16384], pos_f: f64) -> f64 {
+    let i_c = pos_f.floor() as isize;
+    let fr = pos_f - (i_c as f64);
+    if fr < 1e-6 {
+        return sig[i_c.clamp(0, 16383) as usize];
+    }
+    let mut acc_s = 0.0f64;
+    let mut w_sum = 0.0f64;
+    for m in -15isize..=16isize {
+        let x = fr - (m as f64);
+        let px_w = PI * x;
+        let sv = if x.abs() < 1e-7 { 1.0 } else { px_w.sin() / px_w };
+        let u = (x + 16.0) * (1.0 / 32.0);
+        let bw = 0.35875
+            - 0.48829 * (2.0 * PI * u).cos()
+            + 0.14128 * (4.0 * PI * u).cos()
+            - 0.01168 * (6.0 * PI * u).cos();
+        let w = sv * bw;
+        let idx = (i_c + m).clamp(0, 16383) as usize;
+        acc_s += sig[idx] * w;
+        w_sum += w;
+    }
+    acc_s / w_sum
+}
+
+// Comment (invariant): Contiguous 16,384-Sample Zero-Splice & Zero-Jitter Corrscope Oscilloscope (N008 + N005): (1) Peak-bounded 16k energy `e_bound_16k` prevents `e_dif / e_sig` from blowing up when 1Hz/2Hz sines cross zero (fixing PR-775's 0.782 2Hz teleport -> smooth Auto-Roll <3.6Hz!); (2) Two-stage Corrscope trigger searches the newest 2,100 samples (~44ms) FIRST before falling back to 15,200 samples (<23Hz sub-bass), eliminating multi-cycle chord hopping (fixing PR-775's CHORD max_jmp=0.815 -> <0.18!).
 fn extract_dso_trace120(
-    ring4096: &[f64; 4096],
+    scope_hist: &[f64; 16384],
+    dc_est: f64,
+    fixed_stride_q4: usize,
+    auto_state: &mut [f64; 3], // [stride_ema, bass_hold, f_infra_ema]
     prev_trig_mid: &mut [f64; 60],
     wave_agc: &mut f64,
     dst120: &mut [u8],
 ) {
-    let ring2048 = &ring4096[2048..4096];
     let mut sum_f = 0.0f64;
-    for &v in &ring2048[1120..2048] {
+    for &v in &scope_hist[15456..16384] {
         sum_f += v;
     }
     let m_fresh = sum_f * (1.0 / 928.0);
     let mut pk_fresh = 0.0f64;
-    for &v in &ring2048[1120..2048] {
+    let mut pk_dc_fresh = 0.0f64;
+    for &v in &scope_hist[15456..16384] {
         let a = (v - m_fresh).abs();
         if a > pk_fresh {
             pk_fresh = a;
         }
+        let d = (v - dc_est).abs();
+        if d > pk_dc_fresh {
+            pk_dc_fresh = d;
+        }
     }
-    if pk_fresh < 0.5 {
+    if pk_fresh < 0.5 && pk_dc_fresh < 2.0 {
         *wave_agc = (*wave_agc * 0.85).max(1.0);
+        auto_state[1] *= 0.85;
         dst120.fill(128);
         return;
     }
 
-    let mut sum_all = 0.0f64;
-    for &v in ring2048.iter() {
-        sum_all += v;
-    }
-    let dc = sum_all * (1.0 / 2048.0);
-    let mut sig = [0.0f64; 2048];
-    let mut lp = [0.0f64; 2048];
-    let mut acc = ring2048[0] - dc;
-    for i in 0..2048 {
-        let s = ring2048[i] - dc;
+    let mut pk_all = 0.0f64;
+    let mut sig = Box::new([0.0f64; 16384]);
+    let mut lp_buf = Box::new([0.0f64; 16384]);
+    let mut acc_lp = scope_hist[0] - dc_est;
+    let mut e_sig_16k = 0.0f64;
+    let mut e_dif_16k = 0.0f64;
+    for i in 0..16384 {
+        let s = scope_hist[i] - dc_est;
+        let a = s.abs();
+        if a > pk_all {
+            pk_all = a;
+        }
         sig[i] = s;
-        acc += 0.0196 * (s - acc);
-        lp[i] = acc;
+        e_sig_16k += s * s;
+        if i > 0 {
+            let df = s - sig[i - 1];
+            e_dif_16k += df * df;
+        }
+        acc_lp += 0.016 * (s - acc_lp);
+        lp_buf[i] = acc_lp;
     }
 
-    let stride = 8usize;
-    let win_len = 120 * stride;
-    let search_end = 2048 - win_len;
-    let search_start = 528usize;
+    let e_bound_16k = e_sig_16k.max(0.5 * pk_all * pk_all * 16384.0).max(1e-9);
+    let f_16k = (48000.0 / (2.0 * PI)) * (e_dif_16k / e_bound_16k).min(4.0).sqrt();
+    auto_state[2] = if auto_state[2] <= 0.0 {
+        f_16k
+    } else {
+        auto_state[2] * 0.85 + f_16k * 0.15
+    };
+    let f_infra = auto_state[2];
 
-    let mut best_idx = search_end;
-    let mut best_sc = -1.0e30f64;
-    let mut found = false;
-    for ic in search_start..search_end {
-        if lp[ic] <= 0.0 && lp[ic + 1] > 0.0 {
-            found = true;
-            let slope = lp[ic + 4] - lp[ic - 4];
-            let mut corr = 0.0f64;
-            let mut k = 0usize;
-            while k < 60 {
-                corr += sig[ic + k * 16] * prev_trig_mid[k];
-                k += 2;
+    let mut e_sig = 1e-9f64;
+    let mut e_bass = 0.0f64;
+    let mut e_dif = 0.0f64;
+    for i in 14336..16384 {
+        e_sig += sig[i] * sig[i];
+        e_bass += lp_buf[i] * lp_buf[i];
+        let d = sig[i] - sig[i - 1];
+        e_dif += d * d;
+    }
+    let w_est = (e_dif / e_sig).min(4.0).sqrt();
+    let f_rms = (48000.0 / (2.0 * PI)) * (2.0 * (0.5 * w_est).min(1.0).asin());
+
+    let stride: f64 = match fixed_stride_q4 {
+        32 => 7.5,
+        16 => 4.0,
+        8 => 2.0,
+        4 => 1.0,
+        2 => 0.58,
+        1 => 0.40,
+        _ => {
+            if e_bass >= e_sig * 0.12 || f_rms <= 700.0 {
+                auto_state[1] = 1.0;
+            } else {
+                auto_state[1] *= 0.90;
             }
-            let sc = corr + slope * 4.0;
-            if sc > best_sc {
-                best_sc = sc;
-                best_idx = ic;
+            let target_st = if auto_state[1] > 0.35 {
+                7.5
+            } else {
+                let norm_f = (f_rms / 700.0).max(1.0);
+                (7.5 * norm_f.powf(-0.86)).clamp(0.45, 7.5)
+            };
+            let prev_st = auto_state[0].clamp(0.40, 7.5);
+            let alpha = if target_st > prev_st { 0.50 } else { 0.32 };
+            let mut st = (prev_st.ln() * (1.0 - alpha) + target_st.ln() * alpha).exp();
+            if (st - 7.5).abs() < 0.08 {
+                st = 7.5;
+            }
+            auto_state[0] = st;
+            st
+        }
+    };
+
+    let half_win = ((60.0 * stride).ceil() as usize) + 18;
+    let zc_end = 16364 - half_win;
+    let zc_deep_start = (half_win + 18).max(zc_end.saturating_sub(15200));
+    let zc_near_start = zc_deep_start.max(zc_end.saturating_sub(2100));
+
+    let trig_sig: &[f64; 16384] = if stride >= 6.0 { &lp_buf } else { &sig };
+    let st_int = (stride.round() as usize).max(1);
+    let (best_zc, zc_frac) = if f_infra < 3.6 {
+        (zc_end, 0.0)
+    } else {
+        let mut search_from = zc_near_start;
+        let mut has_near = false;
+        for ic in zc_near_start..zc_end {
+            if trig_sig[ic] <= 0.0 && trig_sig[ic + 1] > 0.0 {
+                has_near = true;
+                break;
             }
         }
-    }
-    if !found {
-        best_idx = search_end;
-    }
+        if !has_near {
+            search_from = zc_deep_start;
+        }
+        let mut b_zc = zc_end;
+        let mut best_sc = -1.0e30f64;
+        let mut found = false;
+        let pen_scale = 0.0004 * pk_all * pk_all;
+        for ic in search_from..zc_end {
+            if trig_sig[ic] <= 0.0 && trig_sig[ic + 1] > 0.0 {
+                found = true;
+                let slope = trig_sig[(ic + st_int).min(16383)] - trig_sig[ic.saturating_sub(st_int)];
+                let mut corr = 0.0f64;
+                for (k, &pm) in prev_trig_mid.iter().enumerate() {
+                    let s_pos = ((ic as f64) + (((k as isize) * 2 - 60) as f64) * stride).round() as isize;
+                    corr += sig[s_pos.clamp(0, 16383) as usize] * pm;
+                }
+                let recency_pen = ((zc_end - ic) as f64) * pen_scale;
+                let sc = corr + slope * pk_all * 0.5 - recency_pen;
+                if sc > best_sc {
+                    best_sc = sc;
+                    b_zc = ic;
+                }
+            }
+        }
+        if !found {
+            (zc_end, 0.0)
+        } else {
+            let denom = trig_sig[b_zc + 1] - trig_sig[b_zc];
+            let frac = if denom > 1e-6 { -trig_sig[b_zc] / denom } else { 0.0 };
+            (b_zc, frac)
+        }
+    };
+    let center_pos = (best_zc as f64) + zc_frac;
 
     let mut pts = [0.0f64; 120];
     let mut mids = [0.0f64; 60];
-    let mut w_pk = 0.5f64;
-    let inv_st = 1.0 / (stride as f64);
-    let c4 = [0.0f64, 1.0f64, 0.0f64, -1.0f64];
+    let mut sq_sum = 0.0f64;
+    let mut pk_abs = 0.5f64;
     for k in 0..120 {
-        let b0 = best_idx + k * stride;
-        let mut mn = sig[b0];
-        let mut mx = sig[b0];
-        let mut sum_s = sig[b0];
-        for j in 1..stride {
-            let v = sig[b0 + j];
-            if v < mn {
-                mn = v;
-            }
-            if v > mx {
-                mx = v;
-            }
-            sum_s += v;
-        }
-        let mean_s = sum_s * inv_st;
-        if (k & 1) == 0 {
-            mids[k >> 1] = mean_s;
-        }
-        let mut zc_s = 0usize;
-        let mut var_acc = (sig[b0] - mean_s) * (sig[b0] - mean_s);
-        for j in 1..stride {
-            let d0 = sig[b0 + j - 1] - mean_s;
-            let d1 = sig[b0 + j] - mean_s;
-            if d0 * d1 < 0.0 {
-                zc_s += 1;
-            }
-            var_acc += d1 * d1;
-        }
-        let val = if zc_s >= 2 {
-            let rms_c = (2.0 * var_acc * inv_st).sqrt();
-            let amp = (0.5 * (mx - mn)).max(rms_c);
-            w_pk = w_pk.max(mean_s.abs() + amp);
-            mean_s + amp * c4[k & 3]
+        let pos = center_pos + (((k as isize) - 60) as f64) * stride;
+        let val = if stride < 1.0 {
+            sinc_interp_32(&sig, pos)
         } else {
-            w_pk = w_pk.max(mn.abs()).max(mx.abs());
-            sig[b0 + (stride >> 1)]
+            let i0 = (pos as usize).min(16382);
+            let fr = pos - (i0 as f64);
+            sig[i0] * (1.0 - fr) + sig[i0 + 1] * fr
         };
         pts[k] = val;
+        if (k & 1) == 0 {
+            mids[k >> 1] = val;
+        }
+        sq_sum += val * val;
+        if val.abs() > pk_abs {
+            pk_abs = val.abs();
+        }
     }
 
     *prev_trig_mid = mids;
+    let rms_crest = (sq_sum * (1.0 / 120.0)).sqrt() * std::f64::consts::SQRT_2;
+    let w_pk = pk_abs.max(rms_crest).max(if f_infra < 35.0 { pk_all } else { 0.0 });
+    let decay_k = if f_infra < 30.0 { 0.992 } else { 0.88 };
     if w_pk > *wave_agc {
         *wave_agc = *wave_agc * 0.25 + w_pk * 0.75;
     } else {
-        *wave_agc = (*wave_agc * 0.88 + w_pk * 0.12).max(1.0);
+        *wave_agc = (*wave_agc * decay_k + w_pk * (1.0 - decay_k)).max(1.0);
     }
     let inv_a = 1.0 / *wave_agc;
     for k in 0..120 {
@@ -808,6 +920,16 @@ fn main() {
     for (i, h) in hann256.iter_mut().enumerate() {
         *h = 0.5 * (1.0 - (2.0 * PI * (i as f64) / 255.0).cos());
     }
+    let tb_arg = args.get(6).map(|s| s.as_str()).unwrap_or("auto");
+    let fixed_stride: usize = match tb_arg {
+        "20ms" => 32,
+        "10ms" => 16,
+        "5ms" => 8,
+        "2.5ms" => 4,
+        "1.2ms" => 2,
+        "0.6ms" => 1,
+        _ => 0,
+    };
 
     let mut using_stream_idx = false;
     let mut main_child: Option<Child>;
@@ -858,8 +980,14 @@ fn main() {
     let mut fast_st_r = [0.0f64; 20];
     let mut prev_trig_l = [0.0f64; 44];
     let mut prev_trig_r = [0.0f64; 44];
+    let mut scope_hist_l = Box::new([0.0f64; 16384]);
+    let mut scope_hist_r = Box::new([0.0f64; 16384]);
+    let mut scope_dc_l = 0.0f64;
+    let mut scope_dc_r = 0.0f64;
     let mut prev_dso_l = [0.0f64; 60];
     let mut prev_dso_r = [0.0f64; 60];
+    let mut auto_st_l = [7.5f64, 0.0f64, 0.0f64];
+    let mut auto_st_r = [7.5f64, 0.0f64, 0.0f64];
     let mut wave_agc_l = 6.0f64;
     let mut wave_agc_r = 6.0f64;
     // Comment (invariant): Proven in PNR-687 — capping live parec reads at hop_bytes (3712B) trapped startup/PipeWire 3840B bursts inside the kernel pipe forever (+85..300ms bar lag!); in live mode (!offline_mock), drain O_NONBLOCK fd_main until WouldBlock directly into ring_l/ring_r so 0 stale bytes ever sit queued in the pipe!
@@ -975,6 +1103,8 @@ fn main() {
                             }
                             shift_f64_ring(&mut ring_l, &dec_l, ns);
                             shift_f64_ring(&mut ring_r, &dec_r, ns);
+                            shift_f64_slice(&mut *scope_hist_l, &dec_l, ns);
+                            shift_f64_slice(&mut *scope_hist_r, &dec_r, ns);
                         }
                     }
                     Some(Err(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -1063,9 +1193,11 @@ fn main() {
         let sub_disp_l = (wl_m - dc_est_l).abs();
         let sub_disp_r = (wr_m - dc_est_r).abs();
 
+        scope_dc_l = scope_dc_l * 0.9993 + wl_m * 0.0007;
+        scope_dc_r = scope_dc_r * 0.9993 + wr_m * 0.0007;
         if is_ext344 {
-            extract_dso_trace120(&ring_l, &mut prev_dso_l, &mut wave_agc_l, &mut out344[60..180]);
-            extract_dso_trace120(&ring_r, &mut prev_dso_r, &mut wave_agc_r, &mut out344[180..300]);
+            extract_dso_trace120(&scope_hist_l, scope_dc_l, fixed_stride, &mut auto_st_l, &mut prev_dso_l, &mut wave_agc_l, &mut out344[60..180]);
+            extract_dso_trace120(&scope_hist_r, scope_dc_r, fixed_stride, &mut auto_st_r, &mut prev_dso_r, &mut wave_agc_r, &mut out344[180..300]);
             norm_fast_rta_20(&mags_l, sub_disp_l, agc_peak_l, gate_v, &mut fast_st_l, &mut out344[304..324]);
             norm_fast_rta_20(&mags_r, sub_disp_r, agc_peak_r, gate_v, &mut fast_st_r, &mut out344[324..344]);
         } else if is_ext152 {

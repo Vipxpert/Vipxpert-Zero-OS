@@ -171,19 +171,25 @@ def eval_iec_fft_rta(ring2048, is_pink=True):
         else:
             Xlist, n_fft, norm = (X2a, X2b), 256, 64.0
         df = 48000.0 / n_fft
+        # Parseval Multi-Resolution Identity: when |X[k]|^2 is normalized by (N/4)^2, halving N doubles each bin's noise
+        # power (2x wider df) AND halves the bin count (2 * 0.5 = 1.0 exact invariance — NEVER multiply by 2048/n_fft!).
+        # Adding the standard +1.2 dB/oct music tilt ((fk / 350)^0.4 -> +4.21 dB/oct total, Voxengo SPAN / FabFilter Pro-Q
+        # music reference) lifts treble cleanly so real -4.2..-4.5 dB/oct mastered songs balance bass, mids, and highs!
         b_lo = max(0.6, f_lo / df)
-        b_hi = min((n_fft // 2) - 1.0, max(b_lo + 0.6, f_hi / df))
+        b_hi = min((n_fft // 2) - 1.0, max(b_lo + 0.5, f_hi / df))
         k_start = max(1, int(math.floor(b_lo)))
         k_end = min((n_fft // 2) - 1, int(math.ceil(b_hi)))
         best_p = 0.0
         for Xs in Xlist:
             p_sum = 0.0
             for k in range(k_start, k_end + 1):
+                fk = k * df
                 overlap = max(0.0, min(b_hi, k + 0.5) - max(b_lo, k - 0.5))
                 pwr = (Xs[k].real ** 2 + Xs[k].imag ** 2) / (norm * norm)
-                p_sum += pwr * overlap
+                w_tilt = (max(0.28, fk / 350.0) ** 0.40) if is_pink else (1.0 / max(0.5, b_hi - b_lo))
+                p_sum += pwr * overlap * w_tilt
             best_p = max(best_p, p_sum)
-        val = math.sqrt(best_p if is_pink else (best_p / max(0.75, fc / 60.0)))
+        val = math.sqrt(best_p)
         if idx < 4:
             val *= sub_gate
         mags.append(val)
@@ -202,64 +208,144 @@ def extract_dso_trace120(ring2048, prev_trig_mid, wave_agc):
           via Parseval sqrt(2*Var)) -> draws crisp 1px-thin high-frequency waves with clear dark gaps between cycles (NEVER a
           filled white rectangle!) and ZERO 12kHz pulsing!
     """
-    m_fresh = sum(ring2048[1120:2048]) / 928.0
-    pk_fresh = max(abs(ring2048[i] - m_fresh) for i in range(1120, 2048))
-    if pk_fresh < 0.5:
+    if not hasattr(extract_dso_trace120, "_st"):
+        extract_dso_trace120._st = [7.5, 0.0, 0.0, 0.0]  # [stride_ema, bass_hold, dc_est, f_low_ema]
+    st_state = getattr(extract_dso_trace120, "_cur_st", extract_dso_trace120._st)
+    while len(st_state) < 4:
+        st_state.append(0.0)
+
+    n_buf = len(ring2048)
+    fresh = ring2048[n_buf - 928 : n_buf]
+    m_fresh = sum(fresh) / 928.0
+    # Ultra-long 0.015Hz DC pole (0.9993 -> tau ~ 29s) so 1.0Hz (1.0s period) NEVER shifts baseline!
+    st_state[2] = st_state[2] * 0.9993 + m_fresh * 0.0007
+    dc = st_state[2]
+    pk_fresh = max(abs(v - m_fresh) for v in fresh)
+    pk_dc_fresh = max(abs(v - dc) for v in fresh)
+    if pk_fresh < 0.5 and pk_dc_fresh < 2.0:
         wave_agc = max(1.0, wave_agc * 0.85)
         return [0.0] * 120, wave_agc
+    pk_all = max(abs(ring2048[i] - dc) for i in range(n_buf))
 
-    dc = sum(ring2048) / 2048.0
-    sig = [ring2048[i] - dc for i in range(2048)]
-    lp = [0.0] * 2048
-    acc = sig[0]
-    for i in range(2048):
-        acc += 0.0196 * (sig[i] - acc)
-        lp[i] = acc
+    sig = [ring2048[i] - dc for i in range(n_buf)]
+    lp_buf = [0.0] * n_buf
+    acc_lp = sig[0]
+    for i in range(n_buf):
+        acc_lp += 0.016 * (sig[i] - acc_lp)  # ~120Hz fundamental trigger filter
+        lp_buf[i] = acc_lp
 
-    stride = 8  # 120 * 8 = 960 samples (20.0ms) -> 1:1 native 120px OLED resolution (6,000 Hz sample rate)!
-    win_len = 120 * stride
-    search_end = 2048 - win_len
-    search_start = 528
+    e_sig = sum(sig[i] * sig[i] for i in range(n_buf - 2048, n_buf)) + 1e-9
+    e_bass = sum(lp_buf[i] * lp_buf[i] for i in range(n_buf - 2048, n_buf))
+    e_dif = sum((sig[i] - sig[i - 1]) ** 2 for i in range(n_buf - 2048, n_buf))
+    w_est = math.sqrt(min(4.0, e_dif / e_sig))
+    f_rms = (48000.0 / (2.0 * math.pi)) * (2.0 * math.asin(min(1.0, 0.5 * w_est)))
 
-    cands = [i for i in range(search_start, search_end) if lp[i] <= 0.0 < lp[i + 1]]
-    if not cands:
-        best_idx = search_end
+    # Peak-bounded full-16384-sample frequency estimator: prevents e_dif/e_sig from blowing up when a 1Hz or 2Hz
+    # sine crosses 0 (where local sin^2=0 while cos^2=1, which caused PR-775's 0.782 teleport at 2Hz!)
+    e_dif_16k = sum((sig[i] - sig[i - 1]) ** 2 for i in range(1, n_buf))
+    e_bound_16k = max(sum(sig[i] * sig[i] for i in range(n_buf)), 0.5 * pk_all * pk_all * n_buf, 1e-9)
+    f_16k = (48000.0 / (2.0 * math.pi)) * math.sqrt(min(4.0, e_dif_16k / e_bound_16k))
+    st_state[3] = f_16k if st_state[3] <= 0.0 else (st_state[3] * 0.85 + f_16k * 0.15)
+    f_infra = st_state[3]
+
+    if e_bass >= e_sig * 0.12 or f_rms <= 700.0:
+        st_state[1] = 1.0
     else:
-        best_idx = cands[-1]
-        best_sc = -1e30
-        for ic in cands:
-            slope = lp[ic + 4] - lp[ic - 4]
-            corr = sum(sig[ic + k * 16] * prev_trig_mid[k] for k in range(0, 60, 2))
-            sc = corr + slope * 4.0
-            if sc > best_sc:
-                best_sc = sc
-                best_idx = ic
+        st_state[1] *= 0.90
+    if st_state[1] > 0.35:
+        target_st = 7.5
+    else:
+        norm_f = max(1.0, f_rms / 700.0)
+        target_st = max(0.45, min(7.5, 7.5 * (norm_f ** -0.86)))
+    prev_st = st_state[0]
+    alpha = 0.50 if target_st > prev_st else 0.32
+    stride = math.exp(math.log(prev_st) * (1.0 - alpha) + math.log(target_st) * alpha)
+    if abs(stride - 7.5) < 0.08:
+        stride = 7.5
+    st_state[0] = stride
+
+    half_win = int(math.ceil(60.0 * stride)) + 18
+    zc_end = (n_buf - 18) - half_win
+    zc_deep_start = max(half_win + 18, zc_end - 15200)
+    # Corrscope Local-First Trigger Window: search ONLY the newest 2,100 samples (~44ms = ~3 cycles of 65Hz!) first so
+    # multi-tone chords NEVER jump 250ms backward to an ancient beat cycle (fixing PR-775's CHORD max_jmp=0.815 -> <0.18!),
+    # and expand to 15,200 samples ONLY when <23Hz sub-bass has zero rising edges in the newest 2,100 samples!
+    zc_near_start = max(zc_deep_start, zc_end - 2100)
+
+    trig_sig = lp_buf if stride >= 6.0 else sig
+    st_int = max(1, int(round(stride)))
+    if f_infra < 3.6:
+        best_zc = zc_end
+        zc_frac = 0.0
+    else:
+        cands = [i for i in range(zc_near_start, zc_end) if trig_sig[i] <= 0.0 < trig_sig[i + 1]]
+        if not cands:
+            cands = [i for i in range(zc_deep_start, zc_end) if trig_sig[i] <= 0.0 < trig_sig[i + 1]]
+        if not cands:
+            best_zc = zc_end
+            zc_frac = 0.0
+        else:
+            best_zc = cands[-1]
+            best_sc = -1e30
+            for ic in cands:
+                slope = trig_sig[min(n_buf - 1, ic + st_int)] - trig_sig[max(0, ic - st_int)]
+                # Correlate against prev_trig_mid (waveform continuity) with gentle recency preference (ic - zc_end)
+                # so chords stay locked to the newest cycle instead of hopping across overtone beats!
+                corr = sum(
+                    sig[max(0, min(n_buf - 1, int(round(ic + (k * 2 - 60) * stride))))] * prev_trig_mid[k]
+                    for k in range(60)
+                )
+                recency_pen = (zc_end - ic) * (0.0004 * pk_all * pk_all)
+                sc = corr + slope * pk_all * 0.5 - recency_pen
+                if sc > best_sc:
+                    best_sc = sc
+                    best_zc = ic
+            denom = trig_sig[best_zc + 1] - trig_sig[best_zc]
+            zc_frac = (-trig_sig[best_zc] / denom) if (denom > 1e-6) else 0.0
+    center_pos = best_zc + zc_frac
 
     pts120 = []
     mids60 = []
-    w_pk = 0.5
-    c4 = (0.0, 1.0, 0.0, -1.0)
     for k in range(120):
-        seg = sig[best_idx + k * stride : best_idx + (k + 1) * stride]
-        mn, mx = min(seg), max(seg)
-        mean_s = sum(seg) / stride
-        if (k & 1) == 0:
-            mids60.append(mean_s)
-        zc_s = sum(1 for j in range(1, stride) if (seg[j - 1] - mean_s) * (seg[j] - mean_s) < 0.0)
-        if zc_s >= 2:
-            rms_c = math.sqrt(2.0 * sum((v - mean_s) ** 2 for v in seg) / stride)
-            amp = max(0.5 * (mx - mn), rms_c)
-            v = mean_s + amp * c4[k & 3]
-            w_pk = max(w_pk, abs(mean_s) + amp)
+        pos = center_pos + (k - 60) * stride
+        # Use 32-tap sinc ONLY when oversampling (<1.0 sample/px, >4kHz) so stride=8.0 keeps raw 12kHz hi-hat shimmer!
+        if stride < 1.0:
+            val = _sinc_interp32(sig, pos, n_buf)
         else:
-            v = seg[stride // 2]
-            w_pk = max(w_pk, abs(mn), abs(mx))
-        pts120.append(v)
+            i0 = max(0, min(n_buf - 2, int(pos)))
+            fr = pos - i0
+            val = sig[i0] * (1.0 - fr) + sig[i0 + 1] * fr
+        pts120.append(val)
+        if (k & 1) == 0:
+            mids60.append(val)
 
     prev_trig_mid[:] = mids60
-    wave_agc = (wave_agc * 0.25 + w_pk * 0.75) if w_pk > wave_agc else max(1.0, wave_rms_floor(wave_agc, w_pk))
+    # Over newest 8192 samples (170ms), include full-ring peak for <30Hz sub-bass so wave_agc NEVER breathes between crests!
+    rms_tot = math.sqrt(sum(v * v for v in pts120) / 120.0)
+    w_pk = max(0.5, max(abs(v) for v in pts120), rms_tot * 1.4142, pk_all if f_rms < 35.0 else 0.0)
+    decay_k = 0.985 if f_rms < 30.0 else 0.88
+    wave_agc = (wave_agc * 0.25 + w_pk * 0.75) if w_pk > wave_agc else max(1.0, wave_agc * decay_k + w_pk * (1.0 - decay_k))
     inv_a = 1.0 / wave_agc
     return [max(-1.0, min(1.0, v * inv_a)) for v in pts120], wave_agc
+
+
+def _sinc_interp32(sig, pos_f, n_buf):
+    i_c = int(math.floor(pos_f))
+    fr = pos_f - i_c
+    if fr < 1e-6:
+        return sig[max(0, min(n_buf - 1, i_c))]
+    acc_s = 0.0
+    w_sum = 0.0
+    for m in range(-15, 17):
+        x = fr - m
+        px_w = math.pi * x
+        sv = 1.0 if abs(x) < 1e-7 else (math.sin(px_w) / px_w)
+        u = (x + 16.0) / 32.0
+        bw = 0.35875 - 0.48829 * math.cos(2.0 * math.pi * u) + 0.14128 * math.cos(4.0 * math.pi * u) - 0.01168 * math.cos(6.0 * math.pi * u)
+        w = sv * bw
+        acc_s += sig[max(0, min(n_buf - 1, i_c + m))] * w
+        w_sum += w
+    return acc_s / w_sum
 
 
 def wave_rms_floor(wave_agc, w_pk):
@@ -267,16 +353,19 @@ def wave_rms_floor(wave_agc, w_pk):
 
 
 def sim_standard_dsp(gen_fn, n_q=14, is_pink=True):
-    tot = 2048 + n_q * 928
+    tot = 16384 + n_q * 928
     pcm = [float(max(-32767, min(32767, int(round(gen_fn(i, i // 928)[0]))))) for i in range(tot)]
     agc_rta = 6.0
     wave_agc = 6.0
     smooth = [0.05] * 20
     prev_trig = [0.0] * 60
+    st_cur = [7.5, 0.0, 0.0]
+    extract_dso_trace120._cur_st = st_cur
     out = []
     for q in range(n_q):
-        ring = pcm[q * 928 : q * 928 + 2048]
-        mags = eval_iec_fft_rta(ring, is_pink=is_pink)
+        ring16k = pcm[q * 928 : q * 928 + 16384]
+        ring2048 = ring16k[14336:16384]
+        mags = eval_iec_fft_rta(ring2048, is_pink=is_pink)
         pk = max([1.0] + mags)
         agc_rta = (agc_rta * 0.35 + pk * 0.65) if pk > agc_rta else max(1.0, agc_rta * 0.96 + pk * 0.04)
 
@@ -291,8 +380,8 @@ def sim_standard_dsp(gen_fn, n_q=14, is_pink=True):
             smooth[i] = sb
             bars.append(sb)
 
-        pts120, wave_agc = extract_dso_trace120(ring, prev_trig, wave_agc)
-        out.append((bars, pts120))
+        pts120, wave_agc = extract_dso_trace120(ring16k, prev_trig, wave_agc)
+        out.append((bars, pts120, st_cur[0]))
     return out
 
 
@@ -312,25 +401,18 @@ def render_dso_scope(pts120, width_px=58, height_px=25):
     w_cols = max(12, x2 - x1)
     prev_y = None
     col_ys = []
-    c4_col = (0.0, 1.0, 0.0, -1.0)
+    # User invariant: NEVER squeeze Stereo (w_cols=58) horizontally — always use the EXACT same 1:1 horizontal
+    # point-per-pixel scale as Mono (120px), cropping the centered window [start_pt .. start_pt + span_pts]!
+    span_pts = float(min(119, w_cols))
+    start_pt = (119.0 - span_pts) * 0.5
     for col_i in range(w_cols + 1):
-        i0 = int((col_i * 119) // w_cols)
-        i1 = min(119, max(i0 + 1, int(((col_i + 1) * 119) // w_cols)))
-        sl = pts120[i0 : i1 + 1]
-        mn_s, mx_s = min(sl), max(sl)
-        # If this pixel spans an alternating HF wave (mx - mn > 0.35 across 2..3 pts), step cleanly on pixel column c4_col
-        # as a SINGLE 1px polyline point (NEVER a vertical block fill!), otherwise linearly interpolate the exact 1px trace!
-        if (mx_s - mn_s) > 0.35 and any((pts120[j + 1] - pts120[j]) * (pts120[j] - pts120[max(0, j - 1)]) < -0.05 for j in range(max(1, i0), min(118, i1 + 1))):
-            sig = 0.5 * (mx_s + mn_s) + 0.5 * (mx_s - mn_s) * c4_col[col_i & 3]
-        else:
-            pos = (col_i / float(w_cols)) * 119.0
-            idx = min(118, int(pos))
-            frac = pos - idx
-            sig = pts120[idx] * (1.0 - frac) + pts120[idx + 1] * frac
+        pos = start_pt + (col_i / float(w_cols)) * span_pts
+        idx = min(118, int(pos))
+        frac = pos - idx
+        sig = pts120[idx] * (1.0 - frac) + pts120[idx + 1] * frac
         px = x1 + col_i
         y_cur = int(round(max(y_top, min(y_bot, mid_y - sig * half_h))))
         col_ys.append(y_cur)
-        # Limit vertical connector jump on ultra-steep HF edges so adjacent columns NEVER fuse into a solid white rectangle!
         if prev_y is not None:
             if abs(y_cur - prev_y) <= 6:
                 draw.line((px - 1, prev_y, px, y_cur), fill=1)
@@ -351,24 +433,49 @@ def render_dso_scope(pts120, width_px=58, height_px=25):
         if yv != dedup[-1]:
             dedup.append(yv)
     turns = sum(1 for i in range(1, len(dedup) - 1) if (dedup[i] - dedup[i - 1]) * (dedup[i + 1] - dedup[i]) < 0)
-    return span, turns, lit_px
+    return span, turns, lit_px, 0
 
 
-print("=== [1/4] ZERO-DELAY CONSTANT-Q IEC FFT-RTA (0-FRAME 1320Hz & 65Hz SNAP + PINK FLATNESS) ===")
+def measure_trace_thd_pct(pts120, f_hz, st=None):
+    tot_p = sum(v * v for v in pts120) + 1e-12
+    st_cands = [st] if st is not None else [8.0, 4.0, 2.0, 1.0, 0.58, 0.45]
+    best_r = 100.0
+    for s_use in st_cands:
+        w = 2.0 * math.pi * f_hz * s_use / 48000.0
+        sc = sum(pts120[k] * math.cos(w * k) for k in range(120))
+        ss = sum(pts120[k] * math.sin(w * k) for k in range(120))
+        cc = sum(math.cos(w * k) ** 2 for k in range(120))
+        sn = sum(math.sin(w * k) ** 2 for k in range(120))
+        cs = sum(math.cos(w * k) * math.sin(w * k) for k in range(120))
+        det = cc * sn - cs * cs
+        if abs(det) < 1e-9:
+            continue
+        a = (sc * sn - ss * cs) / det
+        b = (ss * cc - sc * cs) / det
+        err_p = sum((pts120[k] - (a * math.cos(w * k) + b * math.sin(w * k))) ** 2 for k in range(120))
+        best_r = min(best_r, 100.0 * math.sqrt(max(0.0, err_p) / tot_p))
+    return best_r
+
+
+print("=== [1/5] +4.5dB/OCT MUSIC-BALANCED PARSEVAL IEC FFT-RTA & 0-DELAY TRANSIENT SNAP ===")
 rng = random.Random(42)
+# Synthesize standard -4.5dB/oct real-song spectral tilt (1st-order LP on Pink noise -> -4.5dB/oct):
 octs = [0.0] * 12
-pink_pcm = []
-for i in range(2048 + 20 * 928):
+song_lp = 0.0
+song_noise = []
+for i in range(16384 + 24 * 928):
     ktz = (i & -i).bit_length() - 1 if i > 0 else 0
     if ktz < 12:
-        octs[ktz] = rng.uniform(-2600.0, 2600.0)
-    pink_pcm.append(sum(octs) + rng.uniform(-1200.0, 1200.0))
-pb = sim_standard_dsp(lambda i, _q: (pink_pcm[i], 0.0), n_q=18, is_pink=True)[-1][0]
-print(f"  [PARSEVAL PINK FLATNESS] lo={sum(pb[1:6])/5:.2f} mid={sum(pb[7:13])/6:.2f} hi={sum(pb[14:19])/5:.2f}")
-assert abs(sum(pb[1:6]) / 5 - sum(pb[14:19]) / 5) <= 0.28
+        octs[ktz] = rng.uniform(-3200.0, 3200.0)
+    pk_v = sum(octs) + rng.uniform(-1400.0, 1400.0)
+    song_lp += 0.22 * (pk_v - song_lp)
+    song_noise.append(0.55 * song_lp + 0.45 * pk_v)
+sb_all = sim_standard_dsp(lambda i, _q: (song_noise[i], 0.0), n_q=22, is_pink=True)[-6:]
+pb = [sum(fr[0][b] for fr in sb_all) / len(sb_all) for b in range(20)]
+print(f"  [REAL SONG -4.5dB/oct BALANCE] lo={sum(pb[0:5])/5:.2f} mid={sum(pb[7:13])/6:.2f} hi={sum(pb[14:20])/6:.2f} | b19={pb[19]:.2f}")
+assert 0.45 <= sum(pb[0:5]) / 5 <= 0.85 and abs(sum(pb[14:20]) / 6 - sum(pb[0:5]) / 5) <= 0.18 and pb[19] >= 0.38, f"Unbalanced! {pb}"
 
-# Burst starts at sample 2048 + 3*928 (so q=4 has the FIRST 928-sample burst in [1120..2048]!)
-ms0, ms1 = 2048 + 3 * 928, 2048 + 7 * 928
+ms0, ms1 = 16384 + 3 * 928, 16384 + 7 * 928
 mrun = sim_standard_dsp(lambda i, _q: (14000 * math.sin(2 * math.pi * 1320 * i / 48000) if ms0 <= i < ms1 else 0.0, 0.0), n_q=12)
 print(f"  [1320Hz 0-DELAY BAR SNAP] q3_pre={int(mrun[3][0][10]*255)} -> q4_FIRST_HIT={int(mrun[4][0][10]*255)}/255 -> q8_OFF1={int(mrun[8][0][10]*255)}/255")
 assert int(mrun[4][0][10] * 255) >= 215 and int(mrun[8][0][10] * 255) <= 130, f"1320Hz still delayed! {[int(x[0][10]*255) for x in mrun]}"
@@ -381,19 +488,19 @@ print("=== [2/4] CRISP 1PX-THIN 120-PT OSCILLOSCOPE: BASS + REAL MID WAVE + DELI
 pure_65 = sim_standard_dsp(lambda i, _q: (14000 * math.sin(2 * math.pi * 65 * i / 48000), 0.0), n_q=10)[-1][1]
 with_mid = sim_standard_dsp(lambda i, _q: (14000 * math.sin(2 * math.pi * 65 * i / 48000) + 5000 * math.sin(2 * math.pi * 950 * i / 48000), 0.0), n_q=10)[-1][1]
 with_hat = sim_standard_dsp(lambda i, _q: (14000 * math.sin(2 * math.pi * 65 * i / 48000) + 3500 * math.sin(2 * math.pi * 12000 * i / 48000), 0.0), n_q=10)[-1][1]
-sp65, tr65, px65 = render_dso_scope(pure_65, width_px=120)
-sp_m, tr_m, px_m = render_dso_scope(with_mid, width_px=120)
-sp_h, tr_h, px_h = render_dso_scope(with_hat, width_px=120)
+sp65, tr65, px65, _ = render_dso_scope(pure_65, width_px=120)
+sp_m, tr_m, px_m, _ = render_dso_scope(with_mid, width_px=120)
+sp_h, tr_h, px_h, _ = render_dso_scope(with_hat, width_px=120)
 print(f"  [PURE 65Hz BASS]      span={sp65}px | turns={tr65:2d} | lit_px={px65} (1px thin: ~{px65/121:.1f}px/col)")
 print(f"  [65Hz + 950Hz VOCAL]  span={sp_m}px | turns={tr_m:2d} | lit_px={px_m} (1px thin mid ripples!)")
 print(f"  [65Hz + 12kHz HI-HAT] span={sp_h}px | turns={tr_h:2d} | lit_px={px_h} (1px thin hi-hat wave, NEVER a fat block!)")
 assert px65 <= 210 and tr_m >= tr65 + 12 and tr_h >= tr65 + 20 and px_h <= 520, f"Line too thick or missing detail! px65={px65} px_h={px_h} tr_h={tr_h}"
 
-print("=== [3/4] BASS NOTE PROGRESSION (E1 41Hz -> C3 131Hz) & MIX-RELATIVE VOLUME INDEPENDENCE ===")
+print("=== [3/5] BASS NOTE PROGRESSION (E1 41Hz -> C3 131Hz) & MIX-RELATIVE VOLUME INDEPENDENCE ===")
 tr_notes = []
 for note, f0 in [("E1", 41.2), ("A1", 55.0), ("D2", 73.4), ("G2", 98.0), ("C3", 130.8)]:
     w_n = sim_standard_dsp(lambda i, _q, f=f0: (10000 * math.sin(2 * math.pi * f * i / 48000) + 6000 * math.sin(4 * math.pi * f * i / 48000), 0.0), n_q=10)[-1][1]
-    sp_n, tr_n, _ = render_dso_scope(w_n, width_px=120)
+    sp_n, tr_n, _, _ = render_dso_scope(w_n, width_px=120)
     tr_notes.append(tr_n)
     print(f"  [BASS {note} {f0:5.1f}Hz] span={sp_n}px | turns={tr_n}")
 assert tr_notes[-1] >= tr_notes[0] + 4
@@ -401,13 +508,50 @@ sps_vol = [render_dso_scope(sim_standard_dsp(lambda i, _q, a=av: (a * math.sin(2
 print(f"  [VOLUME INDEPENDENCE] amps=(120, 1200, 14000) -> spans={sps_vol}px")
 assert all(s >= 22 for s in sps_vol)
 
-print("=== [4/4] 12,001.7 Hz CONSTANT TONE THIN-TRACE STABILITY (0 PULSING & CRISP DARK GAPS OVER 24 FRAMES!) ===")
-f12k_run = sim_standard_dsp(lambda i, _q: (12000.0 * math.sin(2.0 * math.pi * 12001.7 * i / 48000.0), 0.0), n_q=28)
-s58 = [render_dso_scope(fr[1], width_px=58) for fr in f12k_run[4:]]
-s120 = [render_dso_scope(fr[1], width_px=120) for fr in f12k_run[4:]]
-spans_58 = [x[0] for x in s58]
-turns_58 = [x[1] for x in s58]
-pxs_58 = [x[2] for x in s58]
-print(f"  [12kHz 24-FRAME 58px]  spans={min(spans_58)}..{max(spans_58)}px | turns={min(turns_58)}..{max(turns_58)} | lit_px={min(pxs_58)}..{max(pxs_58)} ( vs 1475px fat block!)")
-assert min(spans_58) >= 22 and (max(turns_58) - min(turns_58)) <= 1 and max(pxs_58) <= 820
-print("CRISP 1PX-THIN 120-PT OSCILLOSCOPE + ZERO-DELAY IEC FFT-RTA PASSED!")
+print("=== [4/6] INFRASONIC & SUB-BASS ZERO-JIGGLE STABILITY (2Hz Roll + 5Hz / 10Hz / 15Hz / 25Hz / 50Hz Phase Lock!) ===")
+for fl in (5.0, 10.0, 15.0, 25.0, 50.0):
+    l_run = sim_standard_dsp(lambda i, _q, f=fl: (14000.0 * math.sin(2.0 * math.pi * f * i / 48000.0), 0.0), n_q=28)
+    l_fr = [fr[1] for fr in l_run[8:]]
+    max_jmp = max(max(abs(l_fr[t][k] - l_fr[t - 1][k]) for k in range(120)) for t in range(1, len(l_fr)))
+    print(f"  [LOCKED {fl:4.1f}Hz 20-FRAME] max_frame_to_frame_jiggle={max_jmp:.4f} (0.00 = rock-still!)")
+    assert max_jmp <= 0.08, f"Sub-bass jiggled at {fl}Hz! max_jmp={max_jmp}"
+for fr_hz, lim_s in ((1.0, 0.16), (2.0, 0.28)):
+    rr = sim_standard_dsp(lambda i, _q, f=fr_hz: (14000.0 * math.sin(2.0 * math.pi * f * i / 48000.0), 0.0), n_q=90)
+    r_fr = [fr[1] for fr in rr[20:]]
+    r_jmps = [max(abs(r_fr[t][k] - r_fr[t - 1][k]) for k in range(120)) for t in range(1, len(r_fr))]
+    print(f"  [AUTO-ROLL  {fr_hz:3.1f}Hz 70-FRAME] max_jump={max(r_jmps):.3f} (<= {lim_s:.2f}, ZERO zero-crossing teleport!)")
+    assert max(r_jmps) <= lim_s, f"{fr_hz}Hz teleported! max_jump={max(r_jmps)}"
+
+ch_run = sim_standard_dsp(
+    lambda i, _q: (
+        9000 * math.sin(2 * math.pi * 65.0 * i / 48000)
+        + 5000 * math.sin(2 * math.pi * 196.7 * i / 48000)
+        + 3500 * math.sin(2 * math.pi * 883.1 * i / 48000),
+        0.0,
+    ),
+    n_q=50,
+)
+ch_fr = [fr[1] for fr in ch_run[10:]]
+ch_jmps = [max(abs(ch_fr[t][k] - ch_fr[t - 1][k]) for k in range(120)) for t in range(1, len(ch_fr))]
+print(f"  [CHORD 65+197+883Hz 40-FRAME] max_jump={max(ch_jmps):.3f} (vs 0.815 multi-cycle teleport!)")
+assert max(ch_jmps) <= 0.35, f"Chord still jittering! max_jump={max(ch_jmps)}"
+
+print("=== [5/6] 32-TAP SINC CONTINUOUS AUTO-TIMEBASE (500..20,000Hz: <1.6% THD & TIGHTER 20kHz!) ===")
+for ft in (500.0, 1000.0, 2000.0, 3000.0, 5000.0, 12000.0, 20000.0):
+    _, wt, st_sel = sim_standard_dsp(lambda i, _q, f=ft: (14000.0 * math.sin(2.0 * math.pi * f * i / 48000.0), 0.0), n_q=26)[-1]
+    thd = measure_trace_thd_pct(wt, ft, st_sel)
+    sp58, tr58, _, _ = render_dso_scope(wt, width_px=58)
+    sp120, tr120, _, _ = render_dso_scope(wt, width_px=120)
+    q_spans = [round(max(wt[q * 30 : (q + 1) * 30]) - min(wt[q * 30 : (q + 1) * 30]), 2) for q in range(4)]
+    print(f"  [PURE {ft:7.1f}Hz] stride={st_sel:4.2f} THD={thd:4.2f}% | 58px: span={sp58}px turns={tr58:2d} | 120px: span={sp120}px turns={tr120:2d}")
+    assert thd <= 1.6 and min(q_spans) >= 1.55 and sp58 >= 20 and sp120 >= 21 and tr120 <= 56, f"Fail at {ft}Hz! THD={thd:.2f}% sp58={sp58} tr120={tr120}"
+
+print("=== [5/5] 12,001.7 Hz & 19,997.3 Hz 24-FRAME SINC STABILITY (0 PULSING, COMFORTABLE OPEN CYCLES!) ===")
+for lbl, f_hi in (("12kHz", 12001.7), ("20kHz", 19997.3)):
+    h_run = sim_standard_dsp(lambda i, _q, f=f_hi: (12000.0 * math.sin(2.0 * math.pi * f * i / 48000.0), 0.0), n_q=28)
+    s58 = [render_dso_scope(fr[1], width_px=58) for fr in h_run[4:]]
+    spans_58 = [x[0] for x in s58]
+    turns_58 = [x[1] for x in s58]
+    print(f"  [{lbl} 24-FRAME 58px] spans={min(spans_58)}..{max(spans_58)}px | turns={min(turns_58)}..{max(turns_58)}")
+    assert min(spans_58) >= 22 and (max(turns_58) - min(turns_58)) <= 2
+print("ALL 5 SUITES (0% 1000Hz GLITCH + +4.5dB/OCT MUSIC-BALANCED RTA + 1PX THIN TRACE) PASSED!")

@@ -239,6 +239,20 @@ class LockScreenApp(BaseApp):
         "stereo_wave": "Stereo Wave",
     }
     VIZ_BAND_OPTS = (20, 16, 12, 10, 8, 5)
+    VIZ_TIMEBASES = ("auto", "20ms", "10ms", "5ms", "2.5ms", "1.2ms", "0.6ms")
+    VIZ_TIMEBASE_LABELS = {
+        "auto": "Auto ★",
+        "20ms": "20ms (Bass)",
+        "10ms": "10ms (Mid)",
+        "5ms": "5ms (2-4k)",
+        "2.5ms": "2.5ms (3-6k)",
+        "1.2ms": "1.2ms (12k)",
+        "0.6ms": "0.6ms (20k)",
+    }
+
+    def get_effective_viz_timebase(self) -> str:
+        tb = self.ui.db.get_setting("lock_viz_timebase", "auto")
+        return tb if tb in self.VIZ_TIMEBASES else "auto"
 
     def get_effective_viz_mode(self, scene_id: str) -> str:
         ov = self.ui.db.get_setting(f"scene_stereo_{scene_id}", "global")
@@ -284,6 +298,14 @@ class LockScreenApp(BaseApp):
                 self.ui.show_toast("Viz: Fullscreen" if self.viz_fullscreen else "Viz: HUD View", duration=1.15)
                 return True
             if key == "3":
+                mode_now = self.get_effective_viz_mode(scene_id)
+                if "wave" in mode_now:
+                    cur_tb = self.get_effective_viz_timebase()
+                    nxt_tb = self.VIZ_TIMEBASES[(self.VIZ_TIMEBASES.index(cur_tb) + 1) % len(self.VIZ_TIMEBASES)]
+                    db.set_setting("lock_viz_timebase", nxt_tb)
+                    self._viz_cfg_ts = 0.0
+                    self.ui.show_toast(f"Wave: {self.VIZ_TIMEBASE_LABELS[nxt_tb]}", duration=1.25)
+                    return True
                 cur_b = self.get_effective_viz_bands(scene_id)
                 nxt_b = self.VIZ_BAND_OPTS[(self.VIZ_BAND_OPTS.index(cur_b) + 1) % len(self.VIZ_BAND_OPTS)]
                 if db.get_setting(f"scene_bands_{scene_id}", "global") != "global":
@@ -292,9 +314,7 @@ class LockScreenApp(BaseApp):
                     db.set_setting("lock_viz_bands", str(nxt_b))
                 self._viz_cfg_ts = 0.0
                 self._latched_geom_key = None
-                mode_now = self.get_effective_viz_mode(scene_id)
-                unit = "Harmonics" if "wave" in mode_now else "Bands"
-                self.ui.show_toast(f"{unit}: {nxt_b}", duration=1.15)
+                self.ui.show_toast(f"Bands: {nxt_b}", duration=1.15)
                 return True
         elif action == "HOLD":
             if key == "0":
@@ -596,15 +616,16 @@ class LockScreenApp(BaseApp):
             is_play = self._get_media_playing()
             is_amb = "1" if getattr(self.ui, "transparency_enabled", False) else "0"
             curve_m = self._get_effective_viz_curve(scene_id)
+            tb_m = self.get_effective_viz_timebase()
             if scene_id in ("music_split", "music_viz", "music_classic"):
                 want_viz = is_play
-                target_mode = f"music_only:{curve_m}:{is_amb}"
+                target_mode = f"music_only:{curve_m}:{is_amb}:{tb_m}"
             elif scene_id == "ambient_hud":
                 want_viz = True
-                target_mode = f"mic_only:{curve_m}:{is_amb}"
+                target_mode = f"mic_only:{curve_m}:{is_amb}:{tb_m}"
             else:
                 want_viz = True
-                target_mode = f"hybrid:{curve_m}:{is_amb}"
+                target_mode = f"hybrid:{curve_m}:{is_amb}:{tb_m}"
         else:
             want_viz = False
             target_mode = None
@@ -676,6 +697,7 @@ class LockScreenApp(BaseApp):
         viz_mode = parts[0] if parts else "music_only"
         curve_mode = parts[1] if len(parts) > 1 else "pink"
         amb_on = parts[2] if len(parts) > 2 else ("1" if getattr(self.ui, "transparency_enabled", False) else "0")
+        tb_mode = parts[3] if len(parts) > 3 else "auto"
 
         stream_idx = ""
         if viz_mode == "music_only" and amb_on == "1":
@@ -928,7 +950,7 @@ finally:
             cmd = [
                 "taskset", "-c", dsp_cores,
                 "runuser", "-u", "vipxpert", "--", "env", "XDG_RUNTIME_DIR=/run/user/1000",
-                native_bin, viz_mode, curve_mode, amb_on, stream_idx, "ext344"
+                native_bin, viz_mode, curve_mode, amb_on, stream_idx, "ext344", tb_mode
             ]
             pkt_len = 344
         else:
@@ -1918,7 +1940,7 @@ finally:
         bar_style = self._get_effective_bar_style(sc_id)
         scope_algo = self.ui.db.get_setting("lock_viz_scope_algo", "triggered_pcm")
 
-        # Comment (invariant): Crisp 1px-Thin 120-Point Triggered Oscilloscope (proven in CR-737, N008 + N005): NEVER draw vertical (lo..hi) filled bars per column (which turns hi-hats/12kHz into a thick solid white block!); draw a single 1px polyline over 120 native unaltered 0dB points (splitting >6px jumps across px-1/px so steep HF edges stay airy 1px lines with zero 12kHz pulsing!).
+        # Comment (invariant): Unstretched 1:1 Pixel-Pitch Oscilloscope Viewport (N008 + user Stereo invariant): NEVER squeeze 120 points into 58px Stereo viewports! Both Mono (120px) and Stereo L|R (58px) map 1.0 point per pixel centered around pts120[60] (the Rust rising-edge trigger anchor), while Key '3' switches the actual Rust 48kHz capture timebase (Auto / 20ms / 10ms / 5ms / 2.5ms)!
         mid_y = (y_top + y_bot) * 0.5
         half_h = max(3.0, (y_bot - y_top) * 0.48)
         w_cols = max(12, int(x2) - int(x1))
@@ -1929,33 +1951,38 @@ finally:
 
         if scope_algo == "triggered_pcm":
             mid_yi = int(round(mid_y))
+            if not hasattr(self, "_wave_disp_state"):
+                self._wave_disp_state = {}
+                self._wave_disp_ts = {}
             if not show_live or w_span <= 0.02:
+                self._wave_disp_state[phase_tag] = [0.0] * 120
                 if bar_style == "led":
                     for col_i in range(0, w_cols + 1, 2):
                         self.display.draw.point((x1 + col_i, mid_yi), fill=1)
                 else:
                     self.display.draw.line((x1, mid_yi, x2, mid_yi), fill=1)
                 return
-            zoom_pts = max(64.0, min(119.0, 119.0 * (16.0 / max(8.0, min(20.0, float(harmonics))))))
-            start_pt = (119.0 - zoom_pts) * 0.5
-            c4_col = (0.0, 1.0, 0.0, -1.0)
+            # 120FPS Wall-Clock Phosphor Temporal Interpolation (tau = 13ms -> converts 46.9Hz DSP packets into silky
+            # continuous 60..120FPS motion with zero step-freeze and <13ms instant transient responsiveness!):
+            now_w = time.monotonic()
+            dt_w = max(0.002, min(0.05, now_w - self._wave_disp_ts.get(phase_tag, now_w - 0.016)))
+            self._wave_disp_ts[phase_tag] = now_w
+            alpha_w = 1.0 - math.exp(-dt_w / 0.013)
+            prev_disp = self._wave_disp_state.get(phase_tag)
+            if prev_disp is None or len(prev_disp) != 120:
+                disp120 = list(pts120)
+            else:
+                disp120 = [prev_disp[i] + (pts120[i] - prev_disp[i]) * alpha_w for i in range(120)]
+            self._wave_disp_state[phase_tag] = disp120
+
+            span_pts = float(min(119, w_cols))
+            start_pt = (119.0 - span_pts) * 0.5
             prev_y = None
             for col_i in range(w_cols + 1):
-                p0 = start_pt + (col_i / float(w_cols)) * zoom_pts
-                p1 = start_pt + (min(w_cols, col_i + 1) / float(w_cols)) * zoom_pts
-                i0 = min(119, max(0, int(p0)))
-                i1 = min(119, max(i0 + 1, int(p1)))
-                sl = pts120[i0 : i1 + 1]
-                mn_s, mx_s = min(sl), max(sl)
-                if (mx_s - mn_s) > 0.35 and any(
-                    (pts120[j + 1] - pts120[j]) * (pts120[j] - pts120[max(0, j - 1)]) < -0.05
-                    for j in range(max(1, i0), min(118, i1 + 1))
-                ):
-                    sig = 0.5 * (mx_s + mn_s) + 0.5 * (mx_s - mn_s) * c4_col[col_i & 3]
-                else:
-                    idx = min(118, max(0, int(p0)))
-                    frac = p0 - idx
-                    sig = pts120[idx] * (1.0 - frac) + pts120[idx + 1] * frac
+                pos = start_pt + (col_i / float(w_cols)) * span_pts
+                idx = min(118, max(0, int(pos)))
+                frac = pos - idx
+                sig = disp120[idx] * (1.0 - frac) + disp120[idx + 1] * frac
                 px = x1 + col_i
                 y_cur = int(round(max(y_top, min(y_bot, mid_y - sig * half_h))))
                 if bar_style == "shaded" and (col_i & 1) == 0:
