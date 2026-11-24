@@ -172,6 +172,7 @@ class DashboardApp(BaseApp):
             self.scroll_offset = 0
 
         self.layout.header_text = "VipXpert OS"
+        self.layout.header_right_cb = self.ui.draw_top_right_battery
         full_body = []
         from src.ui.components import scroll_text
 
@@ -217,21 +218,9 @@ class DashboardApp(BaseApp):
         raw_codec = self.ui.bt_daemon.media_state.get('codec', 'N/A')
         codec_str = str(raw_codec.value if hasattr(raw_codec, 'value') else raw_codec)
 
-        # Stage: Persistent Power Telemetry Rows (Keeps Bat row in the top 3 visible rows on boot and never omits Bat/Pwr rows)
-        # Comment (invariant): Keep Bat: in the top 3 rows before RAM: and Pwr: because LayoutEngine.get_body_capacity() is 3 rows; placing Bat: after RAM: clipped it below the initial viewport.
-        pwr = getattr(self.ui, 'power_state', {})
-        has_pwr = (not pwr.get('error', True)) or (pwr.get('voltage', 0.0) > 0.5)
-        pct = pwr.get('percent', 0.0)
-        icon = pwr.get('icon', '[-]')
-
+        # Stage: Core Hardware Telemetry Rows (Battery % is pinned permanently at top-right of header via UIManager.draw_top_right_battery)
         full_body.append(("Vol: ", display_vol, ""))
         full_body.append(("CPU: ", f"{self.cpu_temp}", ""))
-        if has_pwr:
-            full_body.append(("Bat: ", f"{icon} {pct:.2f}%", ""))
-            full_body.append(("Pwr: ", f"{pwr.get('voltage', 0.0):.2f}V {pwr.get('current', 0.0):.0f}mA", ""))
-        else:
-            full_body.append(("Bat: ", "Probing...", ""))
-            full_body.append(("Pwr: ", "--.--V ---mA", ""))
         if getattr(self, 'ram_usage', 'N/A') != 'N/A':
             full_body.append(("RAM: ", f"{self.ram_usage}", ""))
         
@@ -271,9 +260,33 @@ class DashboardApp(BaseApp):
         else:
             self.layout.footer_text = "[*] Lock   [C] Apps"
 
-        # Inject only the visible slice and right-edge scrollbar into the engine
-        self.layout.body_lines = full_body[self.scroll_offset : self.scroll_offset + capacity]
-        self.layout.scrollbar = (len(full_body), capacity, self.scroll_offset)
+        import time as _tm
+        font_h = self.layout.font_h
+        target_px = float(self.scroll_offset * font_h)
+        now_t = _tm.monotonic()
+        dt = max(0.004, min(0.08, now_t - getattr(self, "_last_scroll_t", now_t - 0.016)))
+        self._last_scroll_t = now_t
+        smooth_on = self.ui.db.get_setting("ui_smooth_scroll", "1") != "0"
+        cur_px = float(getattr(self, "_anim_scroll_px", target_px))
+        cur_px = max(0.0, min(float(max_scroll * font_h), cur_px))
+        if smooth_on and abs(target_px - cur_px) > 0.35:
+            cur_px += (target_px - cur_px) * (1.0 - (2.718281828 ** (-24.0 * dt)))
+            if abs(target_px - cur_px) <= 0.35:
+                cur_px = target_px
+            else:
+                self.display.has_active_marquee = True
+        else:
+            cur_px = target_px
+        self._anim_scroll_px = cur_px
+        if abs(cur_px - target_px) > 0.01:
+            self.layout.full_scroll_lines = full_body
+            self.layout.scroll_px = cur_px
+            self.layout.scrollbar = (len(full_body), capacity, cur_px / float(font_h))
+        else:
+            self.layout.full_scroll_lines = None
+            self.layout.scroll_px = None
+            self.layout.body_lines = full_body[self.scroll_offset : self.scroll_offset + capacity]
+            self.layout.scrollbar = (len(full_body), capacity, float(self.scroll_offset))
 
     def _draw_state(self):
         """Compositor hook to compile time-driven marquee slices and paint the dashboard layout to RAM."""

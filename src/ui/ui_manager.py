@@ -1183,6 +1183,21 @@ class UIManager:
             gp[0].paste(band, (0, y0 - 1))
             gp[1].paste(band, (0, y0 - 1))
 
+    def draw_top_right_battery(self) -> bool:
+        """Single-source DRY top-right battery percentage badge ('88%' or '+88%') with clean black left mask."""
+        pwr = getattr(self, "power_state", {})
+        if pwr.get("error", True) and float(pwr.get("voltage", 0.0)) <= 0.5:
+            return False
+        pct = max(0, min(100, int(round(float(pwr.get("percent", 0.0))))))
+        prefix = "+" if pwr.get("is_charging", False) else ""
+        badge = f"{prefix}{pct}%"
+        font = self.display.font_small
+        tw = int(round(font.getlength(badge))) if hasattr(font, "getlength") else len(badge) * 6
+        bx = max(76, 126 - tw)
+        self.display.draw.rectangle((bx - 3, 0, 127, 11), fill=0)
+        self.display.draw_text(bx, 0, badge)
+        return True
+
     async def composite_frame(self):
         """Master rendering pipeline. Flushes RAM canvas and layers UI components asynchronously."""
         if getattr(self, 'is_screen_off', False) or getattr(self.display, 'is_asleep', False):

@@ -64,6 +64,8 @@ class ListMenuApp(BaseApp):
         # UI State
         self.cursor_index = 0
         self.top_index = 0
+        self._anim_scroll_px = 0.0
+        self._last_scroll_t = 0.0
         self.last_direction = 1  # 1 for Down, -1 for Up
         
         # Unified OS State
@@ -293,17 +295,43 @@ class ListMenuApp(BaseApp):
         self.layout.header_text = self.title
         
         if not self.items:
+            self.layout.full_scroll_lines = None
+            self.layout.scroll_px = None
             self.layout.body_lines = [("", "(Empty List)", "")]
             self.layout.scrollbar = None
             self.layout.render()
             return
-            
+
         window_size = self.layout.get_body_capacity()
-        visible_items = self.items[self.top_index : self.top_index + window_size]
-        
-        body = []
-        
-        for i, item in enumerate(visible_items):
+        font_h = self.layout.font_h
+        target_px = float(self.top_index * font_h)
+        now_t = time.monotonic()
+        dt = max(0.004, min(0.08, now_t - getattr(self, "_last_scroll_t", now_t - 0.016)))
+        self._last_scroll_t = now_t
+        db_obj = getattr(self.ui, "db", None)
+        smooth_on = (db_obj.get_setting("ui_smooth_scroll", "1") != "0") if db_obj else True
+
+        cur_px = float(getattr(self, "_anim_scroll_px", target_px))
+        max_px = float(max(0, len(self.items) - window_size) * font_h)
+        cur_px = max(0.0, min(max_px, cur_px))
+        if not smooth_on or abs(target_px - cur_px) > font_h * (window_size + 2):
+            cur_px = target_px
+        elif abs(target_px - cur_px) > 0.35:
+            alpha = 1.0 - (2.718281828 ** (-24.0 * dt))
+            cur_px += (target_px - cur_px) * alpha
+            if abs(target_px - cur_px) <= 0.35:
+                cur_px = target_px
+            else:
+                self.display.has_active_marquee = True
+        else:
+            cur_px = target_px
+        self._anim_scroll_px = cur_px
+
+        first_vis = max(0, int(cur_px // font_h))
+        last_vis = min(len(self.items), first_vis + window_size + 2)
+
+        def _fmt_row(global_idx: int):
+            item = self.items[global_idx]
             name = item.get('name', '')
             suffix = item.get('suffix', '')
             prefix = item.get('prefix', '')
@@ -320,22 +348,16 @@ class ListMenuApp(BaseApp):
                 elif s_strip.endswith(' >'):
                     end_indicator = '>'
                     suffix = s_strip[:-2].rstrip()
-            
-            # Construct Left Pinned Bread
-            global_idx = self.top_index + i
+
             cursor_str = "> " if global_idx == self.cursor_index else "  "
-            
-            # Only apply numbers to the dynamic list, leaving static CRUD items clean
             if self.use_numbers and global_idx < getattr(self, '_dynamic_count', len(self.items)):
                 num_str = f"{global_idx + 1}. "
             else:
                 num_str = ""
-                
             left_pinned = f"{cursor_str}{num_str}{prefix}"
-            
+
             if global_idx == self.cursor_index:
                 if getattr(self, 'is_tuning', False):
-                    # TUNING ROW: Scroll full "<suffix>" or name instead of truncating with ".."
                     safe_suffix = f"<{suffix}>" if suffix else "< >"
                     right_raw = f"{safe_suffix}{end_indicator}"
                     if len(left_pinned) + len(name) + 1 + len(right_raw) <= 19:
@@ -344,19 +366,13 @@ class ListMenuApp(BaseApp):
                     else:
                         right_pinned = end_indicator
                         avail = max(4, 19 - len(left_pinned) - len(right_pinned))
-                        tune_fusion = f"{name} {safe_suffix}"
-                        display_name = scroll_text(tune_fusion, max_chars=avail)
+                        display_name = scroll_text(f"{name} {safe_suffix}", max_chars=avail)
                 else:
-                    # ACTIVE ROW (Marquee Fusion)
                     right_pinned = end_indicator
                     available_chars = max(3, 19 - len(left_pinned) - len(right_pinned))
                     fusion_text = f"{name} {suffix}" if suffix else name
-                    if len(fusion_text) > available_chars:
-                        display_name = scroll_text(fusion_text, max_chars=available_chars)
-                    else:
-                        display_name = fusion_text
+                    display_name = scroll_text(fusion_text, max_chars=available_chars) if len(fusion_text) > available_chars else fusion_text
             else:
-                # INACTIVE ROW: Scroll overflowing row text cleanly instead of chopping with ".."
                 if suffix and len(suffix) <= (8 - len(end_indicator)):
                     right_pinned = f"{suffix}{end_indicator}"
                     available_chars = max(3, 19 - len(left_pinned) - len(right_pinned))
@@ -366,11 +382,20 @@ class ListMenuApp(BaseApp):
                     available_chars = max(3, 19 - len(left_pinned) - len(right_pinned))
                     fusion_inact = f"{name} {suffix}" if suffix else name
                     display_name = scroll_text(fusion_inact, max_chars=available_chars) if len(fusion_inact) > available_chars else fusion_inact
-                    
-            body.append((left_pinned, display_name, right_pinned))
-                
-        self.layout.body_lines = body
-        self.layout.scrollbar = (len(self.items), window_size, self.top_index)
+            return (left_pinned, display_name, right_pinned)
+
+        if abs(cur_px - target_px) > 0.01:
+            full_rows = [("", "", "")] * len(self.items)
+            for g_i in range(first_vis, last_vis):
+                full_rows[g_i] = _fmt_row(g_i)
+            self.layout.full_scroll_lines = full_rows
+            self.layout.scroll_px = cur_px
+            self.layout.scrollbar = (len(self.items), window_size, cur_px / float(font_h))
+        else:
+            self.layout.full_scroll_lines = None
+            self.layout.scroll_px = None
+            self.layout.body_lines = [_fmt_row(g_i) for g_i in range(self.top_index, min(len(self.items), self.top_index + window_size))]
+            self.layout.scrollbar = (len(self.items), window_size, float(self.top_index))
         self.layout.render()
 
 class TextInputModal(BaseApp):

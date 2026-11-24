@@ -1835,21 +1835,10 @@ finally:
         self.display.draw_text(tx, y, text_s)
 
     def _draw_music_top_right_battery(self):
-        """Draws a fixed top-right battery percentage badge (e.g. '88%' or '+88%') cleanly masking the right tail of y=0 scrolling music titles."""
+        """Delegates fixed top-right battery percentage badge to single-source UIManager.draw_top_right_battery()."""
         if self.ui.db.get_setting("music_top_bat_overlay", "1") == "0":
             return
-        pwr = getattr(self.ui, "power_state", {})
-        if pwr.get("error", True) and float(pwr.get("voltage", 0.0)) <= 0.5:
-            return
-        pct = max(0, min(100, int(round(float(pwr.get("percent", 0.0))))))
-        prefix = "+" if pwr.get("is_charging", False) else ""
-        badge = f"{prefix}{pct}%"
-        font = self.display.font_small
-        tw = int(round(font.getlength(badge))) if hasattr(font, "getlength") else len(badge) * 6
-        bx = max(76, 126 - tw)
-        # Opaque black mask box + 2px left breathing pad so scrolling title glyphs clip cleanly under the fixed battery %
-        self.display.draw.rectangle((bx - 3, 0, 127, 11), fill=0)
-        self.display.draw_text(bx, 0, badge)
+        self.ui.draw_top_right_battery()
 
     def _extract_media_info(self):
         now_m = time.monotonic()

@@ -1117,12 +1117,27 @@ class SettingsApp(ListMenuApp):
         spd_map = {"2.0": "Slow", "3.0": "Normal ★", "4.5": "Fast", "6.0": "Turbo", "10.0": "60px/s"}
         spd_str = spd_map.get(spd, "Normal (3x) ★")
 
+        self.layout.header_right_cb = self.ui.draw_top_right_battery
+
         if self.current_menu == "display_ui":
             self.title = "Display & UI"
-            drv_s = self.db.get_setting("oled_drive_mode", "normal")
-            gm_cur = self.db.get_setting("oled_gray_mode", getattr(self.display, "gray_mode", "hybrid"))
-            gm_tag = {"hybrid": "Hybrid ★", "pwm": "Pure PWM", "dithering": "Dither", "off": "1-Bit"}.get(gm_cur, "Hybrid ★")
+            ln_style = self.db.get_setting("ui_launcher_style", "modern")
+            ln_lbl = "Minimal List" if ln_style == "minimal" else "Modern Dock ★"
+            sm_scr = self.db.get_setting("ui_smooth_scroll", "1") != "0"
+            sm_lbl = "Smooth ★" if sm_scr else "Instant"
             items = [
+                {
+                    "name": "App Launcher",
+                    "suffix": ln_lbl,
+                    "action": lambda: self._cycle_db_opts("ui_launcher_style", ["modern", "minimal"], "modern", 1),
+                    "on_tune": lambda d: self._cycle_db_opts("ui_launcher_style", ["modern", "minimal"], "modern", d)
+                },
+                {
+                    "name": "Menu Scroll",
+                    "suffix": sm_lbl,
+                    "action": lambda: self._cycle_db_opts("ui_smooth_scroll", ["1", "0"], "1", 1),
+                    "on_tune": lambda d: self._cycle_db_opts("ui_smooth_scroll", ["1", "0"], "1", d)
+                },
                 {
                     "name": "Brightness & Drive",
                     "end_indicator": ">",
@@ -1186,7 +1201,6 @@ class SettingsApp(ListMenuApp):
                 {"name": "BLE Tracker Radar", "suffix": "Open >", "action": lambda: asyncio.create_task(self._launch_scene_viewer("ble_radar"))},
                 {"name": "OLED (Pin3/5)", "suffix": oled_ok, "action": lambda: None},
                 {"name": "DAC (0x4C)", "suffix": self._hw_dac_status, "action": lambda: asyncio.create_task(self._refresh_hw_diag(toast=True))},
-                {"name": "UPS (0x43)", "suffix": ups_str, "action": lambda: asyncio.create_task(self._launch_scene_viewer("power_scope"))},
                 {"name": "PMIC (0x36)", "suffix": pmic_lbl, "action": lambda: None},
                 {"name": "I2S BCK/WS", "suffix": f"Pin12/35 {drv_ma}", "action": lambda: None},
                 {"name": "I2S DIN/DAT", "suffix": "Pin40/38 10mA", "action": lambda: None},
