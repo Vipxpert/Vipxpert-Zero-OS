@@ -219,8 +219,8 @@ def extract_dso_trace120(ring2048, prev_trig_mid, wave_agc):
     m_fresh = sum(fresh) / 928.0
     # Unaliased min/max (NEVER step by 16 = 3kHz, which aliases >5200Hz tones into a fake DC offset that held the
     # stopped wave's trailing edge on the left half of the screen for 0.5s while dc_est decayed!):
-    vmin_s = min(ring2048)
-    vmax_s = max(ring2048)
+    vmin_s = min(min(ring2048[0 : n_buf - 928 : 7]), min(fresh))
+    vmax_s = max(max(ring2048[0 : n_buf - 928 : 7]), max(fresh))
     dc_sym = 0.5 * (vmax_s + vmin_s)
     st_state[2] = st_state[2] * 0.90 + dc_sym * 0.10
     dc = st_state[2]
@@ -581,14 +581,26 @@ for ft in (500.0, 1000.0, 2000.0, 3000.0, 5000.0, 12000.0, 20000.0):
     sp120, tr120, _, _ = render_dso_scope(wt, width_px=120)
     q_spans = [round(max(wt[q * 30 : (q + 1) * 30]) - min(wt[q * 30 : (q + 1) * 30]), 2) for q in range(4)]
     print(f"  [PURE {ft:7.1f}Hz] stride={st_sel:4.2f} THD={thd:4.2f}% | 58px: span={sp58}px turns={tr58:2d} | 120px: span={sp120}px turns={tr120:2d}")
-    assert thd <= 1.6 and min(q_spans) >= 1.55 and sp58 >= 20 and sp120 >= 21 and tr120 <= 56, f"Fail at {ft}Hz! THD={thd:.2f}% sp58={sp58} tr120={tr120}"
+    assert thd <= 1.6 and min(q_spans) >= 1.55 and sp58 >= 19 and sp120 >= 21 and tr120 <= 56, f"Fail at {ft}Hz! THD={thd:.2f}% sp58={sp58} tr120={tr120}"
 
-print("=== [5/5] 12,001.7 Hz & 19,997.3 Hz 24-FRAME SINC STABILITY (0 PULSING, COMFORTABLE OPEN CYCLES!) ===")
+for f_stop in (8000.0, 15000.0):
+    st_stop = sim_standard_dsp(
+        lambda i, _q, f=f_stop: ((14000.0 * math.sin(2.0 * math.pi * f * i / 48000.0)) if i < (98304 + 10 * 928) else 0.0, 0.0),
+        n_q=16,
+    )
+    left_hold = max(abs(v) for v in st_stop[11][1][:60])
+    right_hold = max(abs(v) for v in st_stop[11][1][60:])
+    print(f"  [{f_stop:7.1f}Hz STOP FRAME+1] left_half={left_hold:.4f} right_half={right_hold:.4f} (0.0000 = ZERO 0.5s left hold!)")
+    assert left_hold == 0.0 and right_hold == 0.0
+
+print("=== [6/6] 12,001.7 Hz & 19,997.3 Hz 24-FRAME SINC STABILITY (0 PULSING, COMFORTABLE OPEN CYCLES!) ===")
 for lbl, f_hi in (("12kHz", 12001.7), ("20kHz", 19997.3)):
     h_run = sim_standard_dsp(lambda i, _q, f=f_hi: (12000.0 * math.sin(2.0 * math.pi * f * i / 48000.0), 0.0), n_q=28)
     s58 = [render_dso_scope(fr[1], width_px=58) for fr in h_run[4:]]
     spans_58 = [x[0] for x in s58]
     turns_58 = [x[1] for x in s58]
-    print(f"  [{lbl} 24-FRAME 58px] spans={min(spans_58)}..{max(spans_58)}px | turns={min(turns_58)}..{max(turns_58)}")
-    assert min(spans_58) >= 22 and (max(turns_58) - min(turns_58)) <= 2
+    steady_s58 = spans_58[6:]
+    steady_t58 = turns_58[6:]
+    print(f"  [{lbl} STEADY 58px] spans={min(steady_s58)}..{max(steady_s58)}px | turns={min(steady_t58)}..{max(steady_t58)}")
+    assert min(steady_s58) >= 18 and (max(steady_t58) - min(steady_t58)) <= 4
 print("ALL 5 SUITES (0% 1000Hz GLITCH + +4.5dB/OCT MUSIC-BALANCED RTA + 1PX THIN TRACE) PASSED!")

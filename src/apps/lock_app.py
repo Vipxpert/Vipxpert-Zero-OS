@@ -2191,9 +2191,21 @@ finally:
                 self._latched_any_high = any_high
             else:
                 self._latched_any_high = True
+                be_attr = f"_viz_bar_env_{chan_key}"
+                bar_env = getattr(self, be_attr, None)
+                if not bar_env or len(bar_env) != 20:
+                    bar_env = list(live_bins)
+                    setattr(self, be_attr, bar_env)
+                # Wall-Clock dt-Normalized Asymmetric Bar-Body Ballistics: 0.0ms instant upward snap (zero transient
+                # damping!) + smooth hardware-tick-locked exponential release (0.58^dt_ticks) eliminating 46.9Hz PipeWire burst step-jitter!
+                rel_k = 0.58 ** dt_ticks
+                smoothed_bars = []
                 for idx, v in enumerate(live_bins):
-                    if v >= peaks[idx]:
-                        peaks[idx] = v
+                    bv = v if v >= bar_env[idx] else max(0.05, v + (bar_env[idx] - v) * rel_k)
+                    bar_env[idx] = bv
+                    smoothed_bars.append(bv)
+                    if bv >= peaks[idx]:
+                        peaks[idx] = bv
                         peak_holds[idx] = float(hold_frames) * 0.5
                         fall_ticks[idx] = 0.0
                     else:
@@ -2204,7 +2216,8 @@ finally:
                             fall_ticks[idx] += dt_ticks
                             t_norm = min(2.8, fall_ticks[idx] / 25.0)
                             step_d = (v0_drift + (g_coeff * (t_norm ** exp_p) if exp_p > 0.0 else 0.0)) * dt_ticks
-                            peaks[idx] = max(v, peaks[idx] - step_d)
+                            peaks[idx] = max(bv, peaks[idx] - step_d)
+                live_bins = smoothed_bars
             setattr(self, lb_attr, list(live_bins))
             setattr(self, gk_attr, geom_key)
             n_bins = len(live_bins)
