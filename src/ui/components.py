@@ -115,33 +115,39 @@ class ListMenuApp(BaseApp):
             self.toast_task.cancel()
             self.toast_task = None
         self.layout.toast_text = None
+        if hasattr(self.ui, 'clear_toast'):
+            self.ui.clear_toast()
 
     def show_blocking_toast(self, message: str):
-        """Displays a toast and intentionally blocks all keypad input."""
-        self.layout.toast_text = message
+        """Displays a universal blocking toast and locks menu input."""
+        self.layout.toast_text = None
         self.is_working = True
-        self.ui.request_render()
+        if hasattr(self.ui, 'show_toast'):
+            self.ui.show_toast(message, blocking=True)
+        else:
+            self.layout.toast_text = message
+            self.ui.request_render()
 
     def show_info_toast(self, message: str, duration: float = 1.5, timeout: Optional[float] = None):
-        """Displays a toast that unlocks the keypad and instantly vanishes on next keypress."""
+        """Delegates to the single universal compositor toast and unlocks keypad."""
         if timeout is not None:
             duration = timeout
-        if self.toast_task and not self.toast_task.done():
-            self.toast_task.cancel()
-        self.layout.toast_text = message
+        self.layout.toast_text = None
         self.is_working = False
-        self.ui.request_render()
-        self.toast_task = asyncio.create_task(self._clear_toast(duration))
-
-    async def _clear_toast(self, duration: float):
-        """Background countdown to remove info toasts."""
-        try:
-            await asyncio.sleep(duration)
-            self.layout.toast_text = None
+        if hasattr(self.ui, 'show_toast'):
+            self.ui.show_toast(message, duration=duration, blocking=False)
+        else:
+            self.layout.toast_text = message
             self.ui.request_render()
-        except asyncio.CancelledError:
-            # Tripwire triggered! Clean up instantly.
-            self.layout.toast_text = None
+
+    def clear_toast(self):
+        """Clears any active blocking or info toast from both local layout and the universal UIManager compositor."""
+        self.layout.toast_text = None
+        self.is_working = False
+        if hasattr(self.ui, 'clear_toast'):
+            self.ui.clear_toast()
+        else:
+            self.ui.request_render()
 
     async def handle_key(self, action: str, key: str):
         # Ensure tuning state exists cleanly
@@ -155,12 +161,9 @@ class ListMenuApp(BaseApp):
         # Ask the layout engine exactly how many items fit right now
         window_size = self.layout.get_body_capacity()
 
-        # The Tripwire: Instantly kill any active info-toast on the first key touch
-        if self.toast_task is not None and not self.toast_task.done():
-            self.toast_task.cancel()
-            self.toast_task = None
-            self.layout.toast_text = None
-            self.ui.request_render()
+        # Dismiss non-blocking universal info toast immediately on next menu keypress
+        if action == 'DOWN' and getattr(self.ui, '_toast_message', None) and not getattr(self.ui, '_toast_blocking', False):
+            self.ui.clear_toast()
 
         # --- Continuous Repeat Block ---
         if action in ['DOWN', 'REPEAT']:
@@ -305,6 +308,18 @@ class ListMenuApp(BaseApp):
             suffix = item.get('suffix', '')
             prefix = item.get('prefix', '')
             end_indicator = item.get('end_indicator', '')
+            # Comment (decision): Universally extract trailing submenu arrows ('>' or '->') into right-pinned end_indicator so submenu buttons stay visually distinct from inline value toggles across all apps.
+            if not end_indicator and suffix:
+                s_strip = suffix.strip()
+                if s_strip in ('>', '->'):
+                    end_indicator = s_strip
+                    suffix = ''
+                elif s_strip.endswith(' ->'):
+                    end_indicator = '->'
+                    suffix = s_strip[:-3].rstrip()
+                elif s_strip.endswith(' >'):
+                    end_indicator = '>'
+                    suffix = s_strip[:-2].rstrip()
             
             # Construct Left Pinned Bread
             global_idx = self.top_index + i

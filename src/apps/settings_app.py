@@ -64,6 +64,46 @@ class SettingsApp(ListMenuApp):
         self.is_tuning = False
         self.ui.request_render()
 
+    def _open_gray_calibrator(self):
+        """Launches the interactive Gray Engine Calibrator matching dithered 33%/67% shades against Pure PWM."""
+        self._gcal_orig_lo = int(self.db.get_setting("oled_dither_lo", str(getattr(self.display, "dither_lo", 42))))
+        self._gcal_orig_hi = int(self.db.get_setting("oled_dither_hi", str(getattr(self.display, "dither_hi", 70))))
+        self._gcal_orig_algo = self.db.get_setting("oled_dither_algo", getattr(self.display, "dither_algo", "bayer8"))
+        self._gcal_orig_ramp = self.db.get_setting("oled_dither_ramp", "1" if getattr(self.display, "dither_ramp", True) else "0") != "0"
+        self._gcal_lo = max(4, min(96, self._gcal_orig_lo))
+        self._gcal_hi = max(self._gcal_lo, min(96, self._gcal_orig_hi))
+        self._gcal_algo = self._gcal_orig_algo
+        self._gcal_ramp = self._gcal_orig_ramp
+        self._gcal_sel = 0  # 0=Lo(33%), 1=Hi(67%)
+        self.current_menu = "gray_cal"
+        self.is_tuning = False
+        self.ui.request_render()
+
+    def _open_disp_calibrator(self):
+        """Launches live Brightness / Pixel Drive / Contrast demo & tuning screen."""
+        self._dcal_orig_brt = int(self.db.get_setting("brightness", "128"))
+        self._dcal_orig_drv = self.db.get_setting("oled_drive_mode", "normal")
+        self._dcal_orig_inv = self.db.get_setting("invert_display", "0") == "1"
+        self._dcal_brt = self._dcal_orig_brt
+        self._dcal_drv = self._dcal_orig_drv
+        self._dcal_inv = self._dcal_orig_inv
+        self._dcal_sel = 0  # 0=Brightness, 1=Drive, 2=Contrast(Invert)
+        self.current_menu = "disp_cal"
+        self.is_tuning = False
+        self.ui.request_render()
+
+    def _open_gray_mode_calibrator(self):
+        """Launches live Gray Mode (Hybrid/Pure PWM/Dithering/1-Bit) 3D + 4-shade demo & tuning screen."""
+        cur_gm = self.db.get_setting("oled_gray_mode", getattr(self.display, "gray_mode", "hybrid"))
+        if cur_gm not in ("hybrid", "pwm", "dithering", "off"):
+            cur_gm = "hybrid"
+        self._gmcal_orig_gm = cur_gm
+        self._gmcal_orig_dm = self.db.get_setting("oled_dither_mode", getattr(self.display, "dither_mode", "pwm"))
+        self._gmcal_gm = cur_gm
+        self.current_menu = "gray_mode_cal"
+        self.is_tuning = False
+        self.ui.request_render()
+
     async def handle_key(self, action: str, char: str):
         if self.current_menu == "pwm_cal":
             if action in ("CLICK", "HOLD") and char in ("4", "6"):
@@ -84,14 +124,129 @@ class SettingsApp(ListMenuApp):
                 self.db.set_setting("oled_pwm_dt", f"{self._cal_cur_dt:.9f}")
                 if hasattr(self.display, "set_pwm_base_dt"):
                     self.display.set_pwm_base_dt(self._cal_cur_dt)
-                self.current_menu = "display_ui"
+                self.current_menu = "gray_cfg"
                 self._rebuild_menu(preserve_cursor=True)
                 self.show_info_toast(f"Saved {self._cal_cur_dt*1e3:.4f}ms")
                 self.ui.request_render()
             elif action == "CLICK" and char == "D":
                 if hasattr(self.display, "set_pwm_base_dt"):
                     self.display.set_pwm_base_dt(getattr(self, "_cal_orig_dt", 0.006443948))
+                self.current_menu = "gray_cfg"
+                self._rebuild_menu(preserve_cursor=True)
+                self.show_info_toast("Calib Canceled")
+                self.ui.request_render()
+            return
+        if self.current_menu == "disp_cal":
+            if action == "CLICK" and char in ("2", "8"):
+                self._dcal_sel = (getattr(self, "_dcal_sel", 0) + (-1 if char == "2" else 1)) % 3
+                self.ui.request_render()
+            elif action in ("CLICK", "HOLD") and char in ("4", "6"):
+                step = -1 if char == "4" else 1
+                sel = getattr(self, "_dcal_sel", 0)
+                if sel == 0:
+                    pct = round((self._dcal_brt / 255) * 100)
+                    pct = max(0, min(100, pct + step * 5))
+                    self._dcal_brt = round((pct / 100) * 255)
+                    self.display.set_brightness(self._dcal_brt)
+                elif sel == 1:
+                    opts = ["night", "soft", "normal", "crisp"]
+                    idx = (opts.index(self._dcal_drv) + step) % len(opts) if self._dcal_drv in opts else 2
+                    self._dcal_drv = opts[idx]
+                    if hasattr(self.display, "apply_oled_drive_profile"):
+                        self.display.apply_oled_drive_profile("max", self._dcal_drv)
+                else:
+                    self._dcal_inv = not self._dcal_inv
+                    if hasattr(self.display, "set_invert"):
+                        self.display.set_invert(self._dcal_inv)
+                self.ui.request_render()
+            elif action == "CLICK" and char == "C":
+                self.db.set_setting("brightness", str(self._dcal_brt))
+                self.db.set_setting("oled_drive_mode", self._dcal_drv)
+                self.db.set_setting("invert_display", "1" if self._dcal_inv else "0")
                 self.current_menu = "display_ui"
+                self._rebuild_menu(preserve_cursor=True)
+                self.show_info_toast(f"Saved {round((self._dcal_brt/255)*100)}% {self._dcal_drv}")
+                self.ui.request_render()
+            elif action == "CLICK" and char == "D":
+                self.display.set_brightness(getattr(self, "_dcal_orig_brt", 128))
+                if hasattr(self.display, "apply_oled_drive_profile"):
+                    self.display.apply_oled_drive_profile("max", getattr(self, "_dcal_orig_drv", "normal"))
+                if hasattr(self.display, "set_invert"):
+                    self.display.set_invert(getattr(self, "_dcal_orig_inv", False))
+                self.current_menu = "display_ui"
+                self._rebuild_menu(preserve_cursor=True)
+                self.show_info_toast("Display Canceled")
+                self.ui.request_render()
+            return
+        if self.current_menu == "gray_mode_cal":
+            if action in ("CLICK", "HOLD") and char in ("4", "6"):
+                opts = ["hybrid", "pwm", "dithering", "off"]
+                idx = (opts.index(self._gmcal_gm) + (-1 if char == "4" else 1)) % len(opts) if self._gmcal_gm in opts else 0
+                self._gmcal_gm = opts[idx]
+                self.display.gray_mode = self._gmcal_gm
+                self.display.dither_mode = "off" if self._gmcal_gm == "off" else ("spatial" if self._gmcal_gm == "dithering" else "pwm")
+                self.ui.request_render()
+            elif action == "CLICK" and char == "C":
+                # Comment (decision): Sync legacy oled_dither_mode with oled_gray_mode so scenes checking dither_mode (e.g. ambient_cube3d) stay consistent with the single Gray Mode setting.
+                dm = "off" if self._gmcal_gm == "off" else ("spatial" if self._gmcal_gm == "dithering" else "pwm")
+                self.db.set_setting("oled_gray_mode", self._gmcal_gm)
+                self.db.set_setting("oled_dither_mode", dm)
+                self.display.gray_mode = self._gmcal_gm
+                self.display.dither_mode = dm
+                self.current_menu = "gray_cfg"
+                self._rebuild_menu(preserve_cursor=True)
+                self.show_info_toast(f"Gray: {self._gmcal_gm}")
+                self.ui.request_render()
+            elif action == "CLICK" and char == "D":
+                self.display.gray_mode = getattr(self, "_gmcal_orig_gm", "hybrid")
+                self.display.dither_mode = getattr(self, "_gmcal_orig_dm", "pwm")
+                self.current_menu = "gray_cfg"
+                self._rebuild_menu(preserve_cursor=True)
+                self.show_info_toast("Gray Canceled")
+                self.ui.request_render()
+            return
+        if self.current_menu == "gray_cal":
+            if action == "CLICK" and char in ("2", "8"):
+                self._gcal_sel = 1 - getattr(self, "_gcal_sel", 0)
+                self.ui.request_render()
+            elif action in ("CLICK", "HOLD") and char in ("4", "6"):
+                step = -2 if char == "4" else 2
+                if getattr(self, "_gcal_sel", 0) == 0:
+                    self._gcal_lo = max(4, min(self._gcal_hi, self._gcal_lo + step))
+                    self.display.dither_lo = self._gcal_lo
+                else:
+                    self._gcal_hi = max(self._gcal_lo, min(96, self._gcal_hi + step))
+                    self.display.dither_hi = self._gcal_hi
+                self.ui.request_render()
+            elif action == "CLICK" and char == "0":
+                algos = ["bayer8", "bayer4", "bayer2", "cluster", "ign", "floyd", "temporal"]
+                idx = (algos.index(self._gcal_algo) + 1) % len(algos) if self._gcal_algo in algos else 0
+                self._gcal_algo = algos[idx]
+                self.display.dither_algo = self._gcal_algo
+                self.ui.request_render()
+            elif action == "CLICK" and char == "#":
+                self._gcal_ramp = not self._gcal_ramp
+                self.display.dither_ramp = self._gcal_ramp
+                self.ui.request_render()
+            elif action == "CLICK" and char == "C":
+                self.db.set_setting("oled_dither_lo", str(self._gcal_lo))
+                self.db.set_setting("oled_dither_hi", str(self._gcal_hi))
+                self.db.set_setting("oled_dither_algo", self._gcal_algo)
+                self.db.set_setting("oled_dither_ramp", "1" if self._gcal_ramp else "0")
+                self.display.dither_lo = self._gcal_lo
+                self.display.dither_hi = self._gcal_hi
+                self.display.dither_algo = self._gcal_algo
+                self.display.dither_ramp = self._gcal_ramp
+                self.current_menu = "gray_cfg"
+                self._rebuild_menu(preserve_cursor=True)
+                self.show_info_toast(f"Saved Lo:{self._gcal_lo}% Hi:{self._gcal_hi}%")
+                self.ui.request_render()
+            elif action == "CLICK" and char == "D":
+                self.display.dither_lo = getattr(self, "_gcal_orig_lo", 42)
+                self.display.dither_hi = getattr(self, "_gcal_orig_hi", 70)
+                self.display.dither_algo = getattr(self, "_gcal_orig_algo", "bayer8")
+                self.display.dither_ramp = getattr(self, "_gcal_orig_ramp", True)
+                self.current_menu = "gray_cfg"
                 self._rebuild_menu(preserve_cursor=True)
                 self.show_info_toast("Calib Canceled")
                 self.ui.request_render()
@@ -101,6 +256,7 @@ class SettingsApp(ListMenuApp):
                 # Stage: Hierarchical Back Navigation Map (Maps every nested Lock & Scenes view to its parent menu)
                 prev_m = self.current_menu
                 parent_map = {
+                    "gray_cfg":       "display_ui",
                     "lock_slots":     "lock_cfg",
                     "lock_slot_item": "lock_slots",
                     "lock_cat":        "lock_slots",
@@ -215,6 +371,37 @@ class SettingsApp(ListMenuApp):
         self._rebuild_menu(preserve_cursor=True)
         self.ui.request_render()
 
+    def _tune_gray_mode(self, direction: int = 1):
+        """Steps Universal Gray Engine mode (hybrid ★, pwm, dithering) live without touching oled_pwm_dt."""
+        opts = ["hybrid", "pwm", "dithering"]
+        cur = self.db.get_setting("oled_gray_mode", getattr(self.display, "gray_mode", "hybrid"))
+        idx = (opts.index(cur) + direction) % len(opts) if cur in opts else 0
+        nxt = opts[idx]
+        self.db.set_setting("oled_gray_mode", nxt)
+        self.display.gray_mode = nxt
+        self._rebuild_menu(preserve_cursor=True)
+        self.ui.request_render()
+
+    def _tune_dither_algo(self, direction: int = 1):
+        """Steps Universal Gray Engine dither algorithm across all 7 kernels live."""
+        opts = ["bayer8", "bayer4", "bayer2", "cluster", "ign", "floyd", "temporal"]
+        cur = self.db.get_setting("oled_dither_algo", getattr(self.display, "dither_algo", "bayer8"))
+        idx = (opts.index(cur) + direction) % len(opts) if cur in opts else 0
+        nxt = opts[idx]
+        self.db.set_setting("oled_dither_algo", nxt)
+        self.display.dither_algo = nxt
+        self._rebuild_menu(preserve_cursor=True)
+        self.ui.request_render()
+
+    def _toggle_dither_ramp(self, _direction: int = 1):
+        """Toggles between Smooth continuous ramp and 4-Band discrete luminance mapping in _apply_dither_img()."""
+        cur = self.db.get_setting("oled_dither_ramp", "1") != "0"
+        nxt = not cur
+        self.db.set_setting("oled_dither_ramp", "1" if nxt else "0")
+        self.display.dither_ramp = nxt
+        self._rebuild_menu(preserve_cursor=True)
+        self.ui.request_render()
+
     def _toggle_3d_demo(self):
         """Toggles a live 60-120FPS 3D cube & grayscale swatch overlay inside Display & UI."""
         self._show_3d_cube = not getattr(self, "_show_3d_cube", False)
@@ -235,6 +422,66 @@ class SettingsApp(ListMenuApp):
                 bx = 4 + i * 7
                 self.display.draw.rectangle((bx, 48, bx + 4, 56), fill=1)
                 self.display.draw_shaded_rect(bx, 43, bx + 4, 43, shade=0.50, mode_override="pwm", phase_id=i)
+            return
+        if self.current_menu == "gray_cal":
+            from PIL import Image
+            lo = getattr(self, "_gcal_lo", 42)
+            hi = getattr(self, "_gcal_hi", 70)
+            sel = getattr(self, "_gcal_sel", 0)
+            algo = getattr(self, "_gcal_algo", "bayer8")
+            ramp = getattr(self, "_gcal_ramp", True)
+            lo_tag = f">{lo}%<" if sel == 0 else f"{lo}%"
+            hi_tag = f">{hi}%<" if sel == 1 else f"{hi}%"
+            self.display.draw_text(2, 0, f"Lo:{lo_tag} Hi:{hi_tag}", font_type="small")
+            self.display.draw_text(2, 12, f"{algo} {'Ramp' if ramp else '4Bnd'} 0:Alg", font_type="small")
+            self.display.draw_text(2, 24, "2/8:Sel 4/6:+- C:Ok D:X", font_type="small")
+            # Top strip (y=37..48): live dithered 4-band strip (0, 85, 170, 255)
+            row = bytes([0] * 32 + [85] * 32 + [170] * 32 + [255] * 32)
+            g_img = Image.frombytes("L", (128, 12), row * 12)
+            if hasattr(self.display, "_apply_dither_img"):
+                d_img = self.display._apply_dither_img(g_img, algo=algo, d_lo=lo, d_hi=hi, ramp=ramp)
+                self.display.image.paste(d_img, (0, 37))
+            # Bottom strip (y=51..62): solid 155Hz Pure PWM reference (0%, 33%, 67%, 100%)
+            self.display.draw_shaded_rect(32, 51, 63, 62, shade=0.33, mode_override="pwm")
+            self.display.draw_shaded_rect(64, 51, 95, 62, shade=0.67, mode_override="pwm")
+            self.display.draw.rectangle((96, 51, 127, 62), fill=1)
+            return
+        if self.current_menu == "disp_cal":
+            sel = getattr(self, "_dcal_sel", 0)
+            pct = round((getattr(self, "_dcal_brt", 128) / 255) * 100)
+            drv = getattr(self, "_dcal_drv", "normal")
+            inv = getattr(self, "_dcal_inv", False)
+            b_s = f">{pct}%<" if sel == 0 else f"{pct}%"
+            d_s = f">{drv}<" if sel == 1 else drv
+            i_s = f">{'Inv' if inv else 'Std'}<" if sel == 2 else ("Inv" if inv else "Std")
+            self.display.draw_text(2, 0, f"Brt:{b_s} Drv:{d_s}", font_type="small")
+            self.display.draw_text(2, 12, f"Mode:{i_s}  2/8:Row", font_type="small")
+            self.display.draw_text(2, 24, "4/6:Tune  C:Ok  D:X", font_type="small")
+            # Live test pattern: 4-shade PWM strip + solid white + fine grid
+            self.display.draw.rectangle((2, 38, 125, 61), outline=1, fill=0)
+            self.display.draw_shaded_rect(4, 40, 33, 59, shade=0.33, mode_override="pwm")
+            self.display.draw_shaded_rect(34, 40, 63, 59, shade=0.67, mode_override="pwm")
+            self.display.draw.rectangle((64, 40, 93, 59), fill=1)
+            for y in range(40, 60, 2):
+                for x in range(95 + (y & 2), 124, 4):
+                    self.display.draw.point((x, y), fill=1)
+            return
+        if self.current_menu == "gray_mode_cal":
+            gm = getattr(self, "_gmcal_gm", "hybrid")
+            lbl = {"hybrid": "Hybrid ★", "pwm": "Pure PWM", "dithering": "Dithering", "off": "Off (1-Bit)"}.get(gm, gm)
+            self.display.draw_text(2, 0, f"Mode: {lbl}", font_type="small")
+            self.display.draw_text(2, 12, "4/6:Mode C:Ok D:X", font_type="small")
+            # Comment (order): Draw solid white box outline before render_wireframe_3d() so it is captured in ph0/ph1/lo; then composite the 4-shade bar via draw_gray_frame() so Hybrid/PWM/Dithering/Off all render true 4-shade planes.
+            self.display.draw.rectangle((2, 32, 65, 59), outline=1, fill=0)
+            if hasattr(self.display, "render_wireframe_3d"):
+                verts = [(-1,-1,-1),(1,-1,-1),(1,1,-1),(-1,1,-1),(-1,-1,1),(1,-1,1),(1,1,1),(-1,1,1)]
+                edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
+                ang = getattr(self.display, "_frame_seq", 0) * 0.06
+                self.display.render_wireframe_3d(verts, edges, ang * 0.6, ang, cx=98, cy=43, scale=17.0, dist=3.2)
+            if hasattr(self.display, "draw_gray_frame"):
+                row = bytes([0] * 15 + [85] * 15 + [170] * 15 + [255] * 15)
+                self.display.draw_gray_frame(4, 34, 60, 24, row * 24, mode_override=gm)
+            self.display.has_active_marquee = True
             return
         super()._draw_state()
         if getattr(self, "_show_3d_cube", False) and self.current_menu == "display_ui":
@@ -410,7 +657,7 @@ class SettingsApp(ListMenuApp):
     }
 
     def _is_scene_customized(self, scene_id: str) -> bool:
-        for p in ("scene_hud_beh", "scene_seq", "scene_t_sec", "scene_g_sec", "scene_anchor", "scene_stereo", "scene_curve", "scene_bar", "scene_cap", "scene_decay"):
+        for p in ("scene_hud_beh", "scene_seq", "scene_t_sec", "scene_g_sec", "scene_anchor", "scene_stereo", "scene_bands", "scene_curve", "scene_bar", "scene_cap", "scene_decay"):
             if self.db.get_setting(f"{p}_{scene_id}", "global") != "global":
                 return True
         for k_name, d_val in self._SCENE_PARAM_DEFAULTS.get(scene_id, []):
@@ -419,7 +666,7 @@ class SettingsApp(ListMenuApp):
         return False
 
     def _reset_scene_customization(self, scene_id: str):
-        for p in ("scene_hud_beh", "scene_seq", "scene_t_sec", "scene_g_sec", "scene_anchor", "scene_stereo", "scene_curve", "scene_bar", "scene_cap", "scene_decay"):
+        for p in ("scene_hud_beh", "scene_seq", "scene_t_sec", "scene_g_sec", "scene_anchor", "scene_stereo", "scene_bands", "scene_curve", "scene_bar", "scene_cap", "scene_decay"):
             self.db.set_setting(f"{p}_{scene_id}", "global")
         for k_name, d_val in self._SCENE_PARAM_DEFAULTS.get(scene_id, []):
             self.db.set_setting(k_name, d_val)
@@ -492,13 +739,22 @@ class SettingsApp(ListMenuApp):
         self._rebuild_menu(preserve_cursor=True)
         self.ui.request_render()
 
-    # Stage: Global & Per-Scene Stereo/Mono Visualizer Mode Controls
+    # Stage: Global & Per-Scene Visualizer Mode & Band Count Controls (Mono / Stereo / Sine Wave / Stereo Wave)
     def _tune_viz_stereo_mode(self, direction: int = 1):
-        """Steps Global Visualizer Channel Mode between Mono RTA ★ ('mono') and Stereo Split L|R ('stereo')."""
-        opts = ["mono", "stereo"]
+        """Steps Global Visualizer Mode across Mono RTA ★, Stereo L|R, Sine Wave, and Stereo Wave."""
+        opts = ["mono", "stereo", "sine_wave", "stereo_wave"]
         cur = self.db.get_setting("lock_viz_stereo", "mono")
         idx = (opts.index(cur) + direction) % len(opts) if cur in opts else 0
         self.db.set_setting("lock_viz_stereo", opts[idx])
+        self._rebuild_menu(preserve_cursor=True)
+        self.ui.request_render()
+
+    def _tune_viz_bands(self, direction: int = 1):
+        """Steps Global Visualizer Band / Harmonic Count across 20 ★, 16, 12, 10, 8, and 5."""
+        opts = ["20", "16", "12", "10", "8", "5"]
+        cur = self.db.get_setting("lock_viz_bands", "20")
+        idx = (opts.index(cur) + direction) % len(opts) if cur in opts else 0
+        self.db.set_setting("lock_viz_bands", opts[idx])
         self._rebuild_menu(preserve_cursor=True)
         self.ui.request_render()
 
@@ -569,11 +825,20 @@ class SettingsApp(ListMenuApp):
         self.ui.request_render()
 
     def _cycle_scene_stereo_override(self, scene_id: str, direction: int = 1):
-        """Cycles per-scene Visualizer Channel Mode across Use Global ★, Mono RTA, and Stereo L|R."""
-        opts = ["global", "mono", "stereo"]
+        """Cycles per-scene Visualizer Mode across Use Global ★, Mono RTA, Stereo L|R, Sine Wave, and Stereo Wave."""
+        opts = ["global", "mono", "stereo", "sine_wave", "stereo_wave"]
         cur = self.db.get_setting(f"scene_stereo_{scene_id}", "global")
         nxt = opts[(opts.index(cur) + direction) % len(opts)] if cur in opts else "global"
         self.db.set_setting(f"scene_stereo_{scene_id}", nxt)
+        self._rebuild_menu(preserve_cursor=True)
+        self.ui.request_render()
+
+    def _cycle_scene_bands_override(self, scene_id: str, direction: int = 1):
+        """Cycles per-scene Band / Harmonic Count across Use Global ★, 20, 16, 12, 10, 8, and 5."""
+        opts = ["global", "20", "16", "12", "10", "8", "5"]
+        cur = self.db.get_setting(f"scene_bands_{scene_id}", "global")
+        nxt = opts[(opts.index(cur) + direction) % len(opts)] if cur in opts else "global"
+        self.db.set_setting(f"scene_bands_{scene_id}", nxt)
         self._rebuild_menu(preserve_cursor=True)
         self.ui.request_render()
 
@@ -854,16 +1119,19 @@ class SettingsApp(ListMenuApp):
 
         if self.current_menu == "display_ui":
             self.title = "Display & UI"
+            drv_s = self.db.get_setting("oled_drive_mode", "normal")
+            gm_cur = self.db.get_setting("oled_gray_mode", getattr(self.display, "gray_mode", "hybrid"))
+            gm_tag = {"hybrid": "Hybrid ★", "pwm": "Pure PWM", "dithering": "Dither", "off": "1-Bit"}.get(gm_cur, "Hybrid ★")
             items = [
                 {
-                    "name": "Brightness",
-                    "suffix": bright_pct,
-                    "on_tune": self._tune_brightness
+                    "name": "Brightness & Drive",
+                    "end_indicator": ">",
+                    "action": self._open_disp_calibrator
                 },
                 {
-                    "name": "Contrast Mode",
-                    "suffix": invert_str,
-                    "action": self._toggle_invert_display
+                    "name": "Gray & PWM",
+                    "end_indicator": ">",
+                    "action": lambda: self._open_submenu("gray_cfg")
                 },
                 {
                     "name": "Clock Format",
@@ -876,30 +1144,23 @@ class SettingsApp(ListMenuApp):
                     "on_tune": self._tune_oled_fps
                 },
                 {
-                    "name": "PWM Sync Cal",
-                    "suffix": f"{float(self.db.get_setting('oled_pwm_dt', str(getattr(self.display, '_pwm_base_dt', 0.006443948))))*1e3:.3f}ms",
-                    "action": self._open_pwm_calibrator
-                },
-                {
-                    "name": "Pixel Drive",
-                    "suffix": {"night": "Sub-1% Dim", "soft": "Soft Warm", "normal": "Normal ★", "crisp": "Max Punch"}.get(self.db.get_setting("oled_drive_mode", "normal"), "Normal ★"),
-                    "on_tune": self._tune_oled_drive
-                },
-                {
-                    "name": "Gray Shades",
-                    "suffix": {"off": "Off (Wire) ★", "pwm": "Pure PWM Gray", "spatial": "Spatial 4x4", "temporal": "Temporal 2x2"}.get(self.db.get_setting("oled_dither_mode", "off"), "Off (Wire) ★"),
-                    "on_tune": self._tune_oled_dither
-                },
-                {
                     "name": "Scroll Speed",
                     "suffix": spd_str,
                     "on_tune": self._tune_marquee_speed
-                },
-                {
-                    "name": "3D Cube Test",
-                    "suffix": "[ON]" if getattr(self, "_show_3d_cube", False) else "[OFF]",
-                    "action": self._toggle_3d_demo
                 }
+            ]
+        elif self.current_menu == "gray_cfg":
+            self.title = "Gray & PWM"
+            gm = self.db.get_setting("oled_gray_mode", getattr(self.display, "gray_mode", "hybrid"))
+            gm_lbl = {"hybrid": "Hybrid ★", "pwm": "Pure PWM", "dithering": "Dither", "off": "1-Bit"}.get(gm, "Hybrid ★")
+            alg = self.db.get_setting("oled_dither_algo", getattr(self.display, "dither_algo", "bayer8"))
+            lo_v = int(self.db.get_setting("oled_dither_lo", str(getattr(self.display, "dither_lo", 42))))
+            hi_v = int(self.db.get_setting("oled_dither_hi", str(getattr(self.display, "dither_hi", 70))))
+            pwm_ms = float(self.db.get_setting("oled_pwm_dt", str(getattr(self.display, "_pwm_base_dt", 0.006451948)))) * 1e3
+            items = [
+                {"name": "Gray Mode", "suffix": gm_lbl, "end_indicator": ">", "action": self._open_gray_mode_calibrator},
+                {"name": "Dither & Calib", "suffix": alg, "end_indicator": ">", "action": self._open_gray_calibrator},
+                {"name": "PWM Sync Cal", "suffix": f"{pwm_ms:.2f}ms", "end_indicator": ">", "action": self._open_pwm_calibrator},
             ]
         elif self.current_menu == "hw_diag":
             self.title = "Hardware Info"
@@ -914,8 +1175,11 @@ class SettingsApp(ListMenuApp):
             kernel = getattr(self.ui, 'os_kernel', None)
             ir_hw = getattr(kernel, 'ir_hardware', None) if kernel else None
             ir_ok = "TX+RX Ready" if (ir_hw and ir_hw.is_ready()) else "Probing/Off"
+            hwp = getattr(self.ui, 'hw_profile', {}) or {}
+            tier_s = f"{str(hwp.get('tier', 'full')).capitalize()} ({hwp.get('cores', 4)}C)"
 
             items = [
+                {"name": "Board Profile", "suffix": tier_s, "action": lambda: self.show_info_toast(f"DSP:{hwp.get('dsp_us', 0)}us Pack:{hwp.get('pack_us', 0)}us")},
                 {"name": "USB Power Scope", "suffix": "Open >", "action": lambda: asyncio.create_task(self._launch_scene_viewer("power_scope"))},
                 {"name": "Ultrasonic Scope", "suffix": "Open >", "action": lambda: asyncio.create_task(self._launch_scene_viewer("mic_ultrasonic"))},
                 {"name": "IR Logic Scope", "suffix": "Open >", "action": lambda: asyncio.create_task(self._launch_scene_viewer("ir_scope"))},
@@ -966,7 +1230,14 @@ class SettingsApp(ListMenuApp):
         elif self.current_menu == "lock_viz_cfg":
             self.title = "Visualizer Style"
             st_c = self.db.get_setting("lock_viz_stereo", "mono")
-            st_lbl = "Stereo L|R" if st_c == "stereo" else "Mono RTA ★"
+            st_lbl = {
+                "mono": "Mono RTA ★",
+                "stereo": "Stereo L|R",
+                "sine_wave": "Sine Wave",
+                "stereo_wave": "Stereo Wave",
+            }.get(st_c, "Mono RTA ★")
+            bd_c = self.db.get_setting("lock_viz_bands", "20")
+            bd_lbl = f"{bd_c} Bands ★" if bd_c == "20" else f"{bd_c} Bands"
             cv_c = self.db.get_setting("lock_viz_curve", "pink")
             cv_lbl = {"pink": "Pink +3dB ★", "raw": "Raw RTA 0dB"}.get(cv_c, "Pink +3dB ★")
             bar_c = self.db.get_setting("lock_viz_bar_style", "solid")
@@ -977,7 +1248,8 @@ class SettingsApp(ListMenuApp):
             pr_lbl = {"float": "Zero-G Float ★", "studio": "Studio RTA", "feather": "Feather Drift", "heavy": "Heavy Gravity", "custom": "Custom"}.get(pr_c, "Zero-G Float ★")
             items = [
                 {"name": "Live Preview", "suffix": "Test Audio >", "action": lambda: asyncio.create_task(self._launch_category_picker(["music_split", "music_viz", "ambient_hud", "amb_music_hybrid"], None, "music_split"))},
-                {"name": "Channel Mode", "suffix": st_lbl, "action": lambda: self._tune_viz_stereo_mode(1), "on_tune": self._tune_viz_stereo_mode},
+                {"name": "Viz Mode (0)", "suffix": st_lbl, "action": lambda: self._tune_viz_stereo_mode(1), "on_tune": self._tune_viz_stereo_mode},
+                {"name": "Band Count (3)", "suffix": bd_lbl, "action": lambda: self._tune_viz_bands(1), "on_tune": self._tune_viz_bands},
                 {"name": "Physics Preset", "suffix": pr_lbl, "action": lambda: self._tune_viz_cap_decay(1), "on_tune": self._tune_viz_cap_decay},
                 {"name": "Particle Physics", "suffix": "Fine-Tune >", "action": lambda: self._open_submenu("lock_viz_phys")},
                 {"name": "Spectrum Curve", "suffix": cv_lbl, "action": lambda: self._tune_viz_curve(1), "on_tune": self._tune_viz_curve},
@@ -1177,7 +1449,15 @@ class SettingsApp(ListMenuApp):
             sc_lbl = getattr(self, "_tune_scene_label", "Music + Spectrum")
             self.title = f"Viz: {sc_lbl[:12]}"
             st_ov = self.db.get_setting(f"scene_stereo_{sc_id}", "global")
-            st_lbl = {"global": "Use Global ★", "mono": "Mono RTA", "stereo": "Stereo L|R"}.get(st_ov, "Use Global ★")
+            st_lbl = {
+                "global": "Use Global ★",
+                "mono": "Mono RTA",
+                "stereo": "Stereo L|R",
+                "sine_wave": "Sine Wave",
+                "stereo_wave": "Stereo Wave",
+            }.get(st_ov, "Use Global ★")
+            bd_ov = self.db.get_setting(f"scene_bands_{sc_id}", "global")
+            bd_lbl = "Use Global ★" if bd_ov == "global" else f"{bd_ov} Bands"
             c_ov = self.db.get_setting(f"scene_curve_{sc_id}", "global")
             c_lbl = {"global": "Use Global ★", "pink": "Pink +3dB", "raw": "Raw RTA 0dB"}.get(c_ov, "Use Global ★")
             b_ov = self.db.get_setting(f"scene_bar_{sc_id}", "global")
@@ -1187,7 +1467,8 @@ class SettingsApp(ListMenuApp):
             d_ov = self.db.get_setting(f"scene_decay_{sc_id}", "global")
             d_lbl = {"global": "Use Global ★", "float": "Zero-G Float", "studio": "Studio RTA", "feather": "Feather Drift", "heavy": "Heavy Gravity"}.get(d_ov, "Use Global ★")
             items = [
-                {"name": "Channel Mode", "suffix": st_lbl, "action": lambda cid=sc_id: self._cycle_scene_stereo_override(cid, 1), "on_tune": lambda d, cid=sc_id: self._cycle_scene_stereo_override(cid, d)},
+                {"name": "Viz Mode", "suffix": st_lbl, "action": lambda cid=sc_id: self._cycle_scene_stereo_override(cid, 1), "on_tune": lambda d, cid=sc_id: self._cycle_scene_stereo_override(cid, d)},
+                {"name": "Band Count", "suffix": bd_lbl, "action": lambda cid=sc_id: self._cycle_scene_bands_override(cid, 1), "on_tune": lambda d, cid=sc_id: self._cycle_scene_bands_override(cid, d)},
                 {"name": "Physics Preset", "suffix": d_lbl, "action": lambda cid=sc_id: self._cycle_scene_decay_override(cid, 1), "on_tune": lambda d, cid=sc_id: self._cycle_scene_decay_override(cid, d)},
                 {"name": "Spectrum Curve", "suffix": c_lbl, "action": lambda cid=sc_id: self._cycle_scene_curve_override(cid, 1), "on_tune": lambda d, cid=sc_id: self._cycle_scene_curve_override(cid, d)},
                 {"name": "Bar Style", "suffix": b_lbl, "action": lambda cid=sc_id: self._cycle_scene_bar_override(cid, 1), "on_tune": lambda d, cid=sc_id: self._cycle_scene_bar_override(cid, d)},
