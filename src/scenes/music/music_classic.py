@@ -4,17 +4,24 @@ from src.ui.components import scroll_text
 
 
 class MusicClassicScene(ScenePlugin):
-    # Classic music transport scene (Renders track title, artist, progress bar, volume, and DAC/codec marquee)
+    # Classic music transport scene (Supports Key 'C' Fullscreen Visualizer toggle via single-source LockScreenApp engine)
     SCENE_ID = "music_classic"
     TITLE = "Music Classic"
     CATEGORY = "music"
     ORDER = 10
-    GUIDE_TEXT = "5:Play 4/6:Prev/Nxt 1:DAC|2/8:PiVol 7/9:BTVol A/B:Slot"
+    GUIDE_TEXT = "5:Play 4/6:Trk 1:DAC|2/8:PiVol 7/9:BTVol|C:FullViz D:MV/Back|A/B:Slot  *:Sleep/Unlk"
+
+    def handle_key(self, action: str, key: str):
+        if getattr(self.app, "viz_fullscreen", False) or key == "C":
+            return self.app.handle_visualizer_hotkeys(self.SCENE_ID, action, key)
+        return False
 
     def draw(self):
-        # Classic Transport Layout Render (Draws metadata, progress bar, and bottom telemetry)
+        # Classic Transport Layout Render (Or pure 128x64 Fullscreen Visualizer when toggled via Key 'C')
         status_str, title_str, artist_str, pos, dur, codec_str, bt_str = self.app._extract_media_info()
         playing = (status_str == "playing")
+        if getattr(self.app, "viz_fullscreen", False) and self.app.render_visualizer_viewport(2, 2, 125, 61, playing, max_bars=20):
+            return
         icon = "►" if playing else "||"
         m, s = divmod(int(pos), 60)
         dm, ds = divmod(int(dur), 60)

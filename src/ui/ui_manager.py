@@ -27,9 +27,14 @@ class UIManager:
         self.active_apps = {}  # Cache of suspended apps: {app_id: app_instance}
         self.app_registry = {} # Master OS Manifest: {app_id: class_factory}
 
-        # Global Overlay Management
+        # Global Overlay & Universal Compositor Toast State (Single-source toast across all apps & scenes)
         self.active_overlay = None
         self.pending_overlays = []
+        self._toast_message = None
+        self._toast_expire_ts = 0.0
+        self._toast_birth_ts = 0.0
+        self._toast_blocking = False
+        self.hw_profile = {"tier": "full", "cores": 4, "dsp_cores": "0,2"}
 
         # Compositor V-Sync State (Apply hardware I2C0 clock profile & marquee speed immediately on boot)
         self.needs_render = True
@@ -1118,6 +1123,66 @@ class UIManager:
         """Flags the compositor that a visual state change occurred."""
         self.needs_render = True
 
+    # Stage: Universal Compositor Toast (Single-source top-Z toast overlay across all menus, apps, and 3-phase PWM scenes)
+    def show_toast(self, message: str, duration: float = 1.35, blocking: bool = False):
+        now = time.monotonic()
+        self._toast_message = str(message) if message else None
+        self._toast_birth_ts = now
+        self._toast_expire_ts = (now + 3600.0) if blocking else (now + max(0.35, float(duration)))
+        self._toast_blocking = bool(blocking)
+        self.needs_render = True
+
+    def clear_toast(self):
+        if self._toast_message is not None:
+            self._toast_message = None
+            self._toast_blocking = False
+            self.needs_render = True
+
+    def _render_universal_toast(self):
+        msg = self._toast_message
+        if not msg:
+            return
+        now = time.monotonic()
+        if not self._toast_blocking and now >= self._toast_expire_ts:
+            self._toast_message = None
+            self.needs_render = True
+            return
+
+        rem = self._toast_expire_ts - now
+        if rem < 0.45 and not self._toast_blocking:
+            self.display.has_active_marquee = True
+        else:
+            # Schedule deterministic wake right when toast expires so static screens clear it with 0 lag
+            nxt_w = getattr(self.display, 'next_marquee_wake', 0.0)
+            if nxt_w <= 0.0 or self._toast_expire_ts < nxt_w:
+                self.display.next_marquee_wake = self._toast_expire_ts
+
+        line = msg.strip()[:20]
+        font = self.display.font_small
+        try:
+            bb = self.display.draw.textbbox((0, 0), line, font=font)
+            tw = max(16, bb[2] - bb[0])
+        except Exception:
+            tw = len(line) * 6
+        box_w = min(124, tw + 10)
+        x0 = max(2, (128 - box_w) // 2)
+        x1 = min(125, x0 + box_w)
+        y0, y1 = 49, 62
+        tx = x0 + max(3, (box_w - tw) // 2)
+
+        # Crisp bordered high-contrast HUD toast pill + 2px left accent bar
+        self.display.draw.rectangle((max(0, x0 - 1), y0 - 1, min(127, x1 + 1), min(63, y1 + 1)), fill=0)
+        self.display.draw.rectangle((x0, y0, x1, y1), fill=0, outline=1)
+        self.display.draw.rectangle((x0, y0, min(x1, x0 + 2), y1), fill=1)
+        self.display.draw.text((tx, y0 + 1), line, font=font, fill=1)
+
+        # Comment (invariant): Mirror active universal toast strip onto _pwm_gray_planes (ph1/lo) whenever 3-phase PWM shading is active on the frame so grayscale savers/visualizers never flicker through the toast box.
+        gp = getattr(self.display, '_pwm_gray_planes', None)
+        if gp is not None:
+            band = self.display.image.crop((0, y0 - 1, 128, 64))
+            gp[0].paste(band, (0, y0 - 1))
+            gp[1].paste(band, (0, y0 - 1))
+
     async def composite_frame(self):
         """Master rendering pipeline. Flushes RAM canvas and layers UI components asynchronously."""
         if getattr(self, 'is_screen_off', False) or getattr(self.display, 'is_asleep', False):
@@ -1147,7 +1212,10 @@ class UIManager:
                 print(f"[Compositor] Overlay _draw_state error: {e}", flush=True)
                 traceback.print_exc()
 
-        # 3. Master Hardware Flush (Yields CPU to background thread)
+        # 3. Universal Top-Z Toast Layer (Shared by all menus, apps, and Lock Screen scenes)
+        self._render_universal_toast()
+
+        # 4. Master Hardware Flush (Yields CPU to background thread)
         await self.display.show()
         t_c3 = time.monotonic()
         self._last_comp_draw_ms = round((t_c2 - t_c1) * 1000.0, 2)
@@ -1387,6 +1455,9 @@ class UIManager:
                 "category_scenes": list(getattr(app, 'category_scenes', []) or []),
                 "manual_override": bool(getattr(app, 'manual_override', False)),
                 "hash_step": int(getattr(app, '_hash_step', 0)),
+                "viz_fullscreen": bool(getattr(app, 'viz_fullscreen', False)),
+                "viz_mode": app.get_effective_viz_mode(cur_sc) if hasattr(app, 'get_effective_viz_mode') and cur_sc else None,
+                "viz_bands": app.get_effective_viz_bands(cur_sc) if hasattr(app, 'get_effective_viz_bands') and cur_sc else None,
             }
 
         arb = getattr(self, 'media_arbiter', None)
@@ -1410,6 +1481,8 @@ class UIManager:
             "is_screen_off": bool(getattr(self, 'is_screen_off', False)),
             "has_overlay": self.active_overlay is not None,
             "overlay_type": type(self.active_overlay).__name__ if self.active_overlay is not None else None,
+            "toast": self._toast_message,
+            "hw_profile": dict(getattr(self, 'hw_profile', {})),
             "menu": menu_info,
             "lock": lock_info,
             "audio": {
