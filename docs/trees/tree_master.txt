@@ -18,7 +18,7 @@
         ├── /src/hardware -> power_monitor.py, keypad.py (90Hz Open-Drain 3-pass batch-ioctl 2/3 majority scanner & zero-lag call_soon_threadsafe asyncio.Queue), display.py
         └── /src/ui -> base_app.py, components.py, ui_manager.py, layout.py, scene_manager.py
     ├── tree_core_app.txt (Core system applications: hierarchical Audio/DSP/DAC/Mic settings hub with Ultrasonic Scope launcher, hardware telemetry Dashboard, system Settings & Lock/MV/Hardware Info diagnostics with Field Scopes, Recent task manager, and 5-Slot Priority Lock Screen & modular ScenePlugin host)
-        ├── /src/apps -> audio_settings_app.py, cartridge_app.py, dashboard.py, settings_app.py, recent_app.py, lock_app.py
+        ├── /src/apps -> audio_settings_app.py, cartridge_app.py, dashboard.py, launcher_app.py, settings_app.py, recent_app.py, lock_app.py
         └── /src/scenes (Categorized Lock Screen ScenePlugin modules & folder bundles)
             ├── /clocks -> clock_digital.py, clock_analog.py
             ├── /music -> music_classic.py, music_split.py, music_viz.py, ambient_hud.py, amb_music_hybrid.py, /bad_apple/scene.py (Universal native-FPS Music Video engine with video_rules.json, 155.18Hz zero-overrun multi-span Pure PWM, and background pre-caching)
