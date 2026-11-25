@@ -45,6 +45,7 @@ class WiFiManagerApp(ListMenuApp):
         super().__init__(display, ui_manager, title="Wi-Fi", items=[], parent_app_id='settings')
         self.is_working: bool = False
         self._poll_task: Optional[asyncio.Task] = None
+        self._ssid_to_profile: dict = {}
 
     async def on_start(self):
         self.show_blocking_toast("Loading...")
@@ -57,6 +58,8 @@ class WiFiManagerApp(ListMenuApp):
     async def on_stop(self):
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
+        if getattr(self, 'is_working', False):
+            self.clear_toast()
 
     async def _auto_poll(self):
         """Silently refreshes the network list based on the global OS boot policy."""
@@ -104,13 +107,36 @@ class WiFiManagerApp(ListMenuApp):
             unique_networks = []
             
             if is_on:
-                # 1. Get all saved connection profiles
+                # 1. Get all saved Wi-Fi connection profiles and map 802-11-wireless.ssid -> profile NAME
+                # Comment (invariant): NetworkManager profile NAMEs (e.g. 'netplan-wlan0-Stereo Google') often differ from the raw SSID; map by 802-11-wireless.ssid so saved networks show '*' and nmcli con up/modify/delete targets the real profile ID.
                 proc_saved = await asyncio.create_subprocess_exec(
-                    'nmcli', '-t', '-f', 'NAME', 'con', 'show',
+                    'nmcli', '-t', '-f', 'NAME,TYPE', 'con', 'show',
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                 )
                 out_saved, _ = await proc_saved.communicate()
-                saved_ssids = set(out_saved.decode().strip().split('\n'))
+                wifi_profiles = []
+                for _pline in out_saved.decode().strip().split('\n'):
+                    if not _pline or ':' not in _pline:
+                        continue
+                    _pname, _ptype = _pline.rsplit(':', 1)
+                    if _ptype == '802-11-wireless' and _pname:
+                        wifi_profiles.append(_pname)
+                async def _get_profile_ssid(_pname: str):
+                    _p = await asyncio.create_subprocess_exec(
+                        'nmcli', '-t', '-f', '802-11-wireless.ssid', 'con', 'show', 'id', _pname,
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                    )
+                    _o, _ = await _p.communicate()
+                    _s = _o.decode().strip()
+                    if ':' in _s:
+                        _s = _s.split(':', 1)[1]
+                    return _pname, _s
+                _mapped = await asyncio.gather(*(_get_profile_ssid(n) for n in wifi_profiles)) if wifi_profiles else []
+                ssid_to_profile = {}
+                for _pname, _pssid in _mapped:
+                    if _pssid and (_pssid not in ssid_to_profile or _pname == _pssid):
+                        ssid_to_profile[_pssid] = _pname
+                self._ssid_to_profile = ssid_to_profile
     
                 # 2. Get visible networks: SSID, SIGNAL, IN-USE
                 proc_net = await asyncio.create_subprocess_exec(
@@ -136,7 +162,7 @@ class WiFiManagerApp(ListMenuApp):
                             signal = 0
                             
                         is_active = (in_use_flag == '*')
-                        is_saved = (ssid in saved_ssids)
+                        is_saved = (ssid in ssid_to_profile)
                         parsed_networks.append({'ssid': ssid, 'signal': signal, 'active': is_active, 'saved': is_saved})
     
                 # Sort: Active first, then by signal strength descending
@@ -167,16 +193,15 @@ class WiFiManagerApp(ListMenuApp):
 
             self.update_items(new_items, preserve_cursor=True, new_static_items=static_footer)
             if getattr(self, 'is_working', False):
-                self.is_working = False
-                self.layout.toast_text = None
+                # Comment (invariant): Call clear_toast() instead of only clearing layout.toast_text so UIManager._toast_blocking is cleared on the universal Layer-3 compositor.
+                self.clear_toast()
             
         except Exception as e:
             print(f"[WiFi App] Poll Error: {e}")
             if not self.items:
                 self.update_items([{"name": "Scan Error", "id": "none"}], new_static_items=[])
             if getattr(self, 'is_working', False):
-                self.is_working = False
-                self.layout.toast_text = None
+                self.clear_toast()
 
         # Only force redraw if user is actively looking at the list
         if self.ui.current_app_id == 'wifi_manager':
@@ -253,9 +278,9 @@ class WiFiManagerApp(ListMenuApp):
                 state = 'unknown'
 
             if state in ['active', 'saved']:
-                # Query the current auto-connect status using the explicit 'id' keyword
+                profile_id = self._ssid_to_profile.get(selected_ssid, selected_ssid)
                 proc = await asyncio.create_subprocess_exec(
-                    'nmcli', '-t', '-f', 'connection.autoconnect', 'con', 'show', 'id', selected_ssid,
+                    'nmcli', '-t', '-f', 'connection.autoconnect', 'con', 'show', 'id', profile_id,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                 )
                 out, _ = await proc.communicate()
@@ -293,12 +318,13 @@ class WiFiManagerApp(ListMenuApp):
             self.show_blocking_toast("Executing...")
         
         try:
+            profile_id = self._ssid_to_profile.get(ssid, ssid)
             if cmd == 'disconnect':
-                proc = await asyncio.create_subprocess_exec('sudo', 'nmcli', 'con', 'down', 'id', ssid)
+                proc = await asyncio.create_subprocess_exec('sudo', 'nmcli', 'con', 'down', 'id', profile_id)
             elif cmd == 'forget':
-                proc = await asyncio.create_subprocess_exec('sudo', 'nmcli', 'con', 'delete', 'id', ssid)
+                proc = await asyncio.create_subprocess_exec('sudo', 'nmcli', 'con', 'delete', 'id', profile_id)
             elif cmd == 'connect':
-                proc = await asyncio.create_subprocess_exec('sudo', 'nmcli', 'con', 'up', 'id', ssid)
+                proc = await asyncio.create_subprocess_exec('sudo', 'nmcli', 'con', 'up', 'id', profile_id)
             elif cmd == 'connect_new':
                 if password:
                     proc = await asyncio.create_subprocess_exec('sudo', 'nmcli', 'dev', 'wifi', 'connect', ssid, 'password', password)
@@ -307,7 +333,7 @@ class WiFiManagerApp(ListMenuApp):
             elif cmd == 'toggle_auto':
                 # Reading doesn't require sudo
                 proc_chk = await asyncio.create_subprocess_exec(
-                    'nmcli', '-t', '-f', 'connection.autoconnect', 'con', 'show', 'id', ssid, 
+                    'nmcli', '-t', '-f', 'connection.autoconnect', 'con', 'show', 'id', profile_id, 
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                 )
                 out, _ = await proc_chk.communicate()
@@ -316,7 +342,7 @@ class WiFiManagerApp(ListMenuApp):
                 new_state = "yes" if ('no' in val or val == '') else "no"
                 
                 # Writing the new state requires sudo
-                proc = await asyncio.create_subprocess_exec('sudo', 'nmcli', 'con', 'modify', 'id', ssid, 'connection.autoconnect', new_state)
+                proc = await asyncio.create_subprocess_exec('sudo', 'nmcli', 'con', 'modify', 'id', profile_id, 'connection.autoconnect', new_state)
             
             await proc.communicate()
             
