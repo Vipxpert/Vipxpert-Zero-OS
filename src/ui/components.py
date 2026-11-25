@@ -67,6 +67,8 @@ class ListMenuApp(BaseApp):
         self._anim_scroll_px = 0.0
         self._last_scroll_t = 0.0
         self.last_direction = 1  # 1 for Down, -1 for Up
+        if hasattr(self.ui, 'draw_top_right_battery'):
+            self.layout.header_right_cb = self.ui.draw_top_right_battery
         
         # Unified OS State
         self.toast_task: Optional[asyncio.Task] = None
@@ -309,7 +311,8 @@ class ListMenuApp(BaseApp):
         dt = max(0.004, min(0.08, now_t - getattr(self, "_last_scroll_t", now_t - 0.016)))
         self._last_scroll_t = now_t
         db_obj = getattr(self.ui, "db", None)
-        smooth_on = (db_obj.get_setting("ui_smooth_scroll", "1") != "0") if db_obj else True
+        is_min = self.ui.is_minimal_ui() if hasattr(self.ui, "is_minimal_ui") else False
+        smooth_on = (not is_min) and ((db_obj.get_setting("ui_smooth_scroll", "1") != "0") if db_obj else True)
 
         cur_px = float(getattr(self, "_anim_scroll_px", target_px))
         max_px = float(max(0, len(self.items) - window_size) * font_h)
@@ -356,32 +359,33 @@ class ListMenuApp(BaseApp):
                 num_str = ""
             left_pinned = f"{cursor_str}{num_str}{prefix}"
 
-            if global_idx == self.cursor_index:
-                if getattr(self, 'is_tuning', False):
-                    safe_suffix = f"<{suffix}>" if suffix else "< >"
-                    right_raw = f"{safe_suffix}{end_indicator}"
-                    if len(left_pinned) + len(name) + 1 + len(right_raw) <= 19:
-                        right_pinned = right_raw
-                        display_name = name
-                    else:
-                        right_pinned = end_indicator
-                        avail = max(4, 19 - len(left_pinned) - len(right_pinned))
-                        display_name = scroll_text(f"{name} {safe_suffix}", max_chars=avail)
+            # Comment (invariant): Universal DRY 2-Column Row Engine — whenever an item has a right-side value (`suffix`) or `end_indicator`, keep Column 1 (`name`) and Column 2 (`suffix` + `end_indicator`) strictly in their own columns and marquee-scroll Column 2 independently when >9 chars (or >54px) so values NEVER merge/disappear on focus and NEVER collide with Column 1!
+            font = getattr(self.display, "font_small", None)
+            px_fn = (lambda s: int(round(font.getlength(s)))) if (font is not None and hasattr(font, "getlength")) else (lambda s: len(s) * 6)
+            right_edge = 123 if len(self.items) > window_size else 126
+            left_px = px_fn(left_pinned)
+
+            is_active = (global_idx == self.cursor_index)
+            is_tune_row = is_active and getattr(self, 'is_tuning', False)
+
+            if suffix or is_tune_row:
+                val_core = f"<{suffix}>" if is_tune_row else suffix
+                max_col2_chars = max(5, 9 - len(end_indicator))
+                if px_fn(f"{val_core}{end_indicator}") > 58 or len(val_core) > max_col2_chars:
+                    scrolled_val = scroll_text(val_core, max_chars=max_col2_chars)
+                    right_pinned = f"{scrolled_val}{end_indicator}"
                 else:
-                    right_pinned = end_indicator
-                    available_chars = max(3, 19 - len(left_pinned) - len(right_pinned))
-                    fusion_text = f"{name} {suffix}" if suffix else name
-                    display_name = scroll_text(fusion_text, max_chars=available_chars) if len(fusion_text) > available_chars else fusion_text
+                    right_pinned = f"{val_core}{end_indicator}"
             else:
-                if suffix and len(suffix) <= (8 - len(end_indicator)):
-                    right_pinned = f"{suffix}{end_indicator}"
-                    available_chars = max(3, 19 - len(left_pinned) - len(right_pinned))
-                    display_name = scroll_text(name, max_chars=available_chars) if len(name) > available_chars else name
-                else:
-                    right_pinned = end_indicator
-                    available_chars = max(3, 19 - len(left_pinned) - len(right_pinned))
-                    fusion_inact = f"{name} {suffix}" if suffix else name
-                    display_name = scroll_text(fusion_inact, max_chars=available_chars) if len(fusion_inact) > available_chars else fusion_inact
+                right_pinned = end_indicator
+
+            right_px = px_fn(right_pinned) if right_pinned else 0
+            avail_col1_px = max(24, right_edge - left_px - (right_px + 5 if right_px else 0))
+            if px_fn(name) > avail_col1_px:
+                max_c1_chars = max(4, avail_col1_px // 6)
+                display_name = scroll_text(name, max_chars=max_c1_chars)
+            else:
+                display_name = name
             return (left_pinned, display_name, right_pinned)
 
         if abs(cur_px - target_px) > 0.01:

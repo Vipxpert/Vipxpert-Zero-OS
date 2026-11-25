@@ -42,6 +42,8 @@ class AppLauncherApp(BaseApp):
         self._minimal_menu.layout.header_right_cb = self.ui.draw_top_right_battery
 
     def _is_minimal(self) -> bool:
+        if hasattr(self.ui, "is_minimal_ui") and self.ui.is_minimal_ui():
+            return True
         return self.db.get_setting("ui_launcher_style", "modern") == "minimal"
 
     def _sync_minimal_cursor(self):
@@ -83,10 +85,6 @@ class AppLauncherApp(BaseApp):
         self.ui.request_render()
 
     async def handle_key(self, action: str, key: str):
-        if action == "CLICK" and key == "#":
-            self._toggle_style()
-            return
-
         if self._is_minimal():
             await self._minimal_menu.handle_key(action, key)
             self.cursor_index = self._minimal_menu.cursor_index
@@ -235,4 +233,4 @@ class AppLauncherApp(BaseApp):
             else:
                 d.point((px + 1, 58), fill=1)
         self.display.draw_text(2, 53, "A/B")
-        self.display.draw_text(102, 53, "#:Min")
+        self.display.draw_text(100, 53, "C:Open")

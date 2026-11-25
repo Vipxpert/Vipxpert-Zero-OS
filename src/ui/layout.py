@@ -43,7 +43,35 @@ class LayoutEngine:
         if self.footer_text:
             end_y = footer_y - 2
 
-        # 1. Flexible Body (Supports smooth high-FPS sub-row pixel scrolling with clean header/footer clipping!)
+        font = getattr(self.display, "font_small", None)
+
+        def _px_w(txt: str) -> int:
+            if not txt:
+                return 0
+            if font is not None and hasattr(font, "getlength"):
+                return int(round(font.getlength(txt)))
+            return len(txt) * 6
+
+        def _draw_row_2col(y_pos: int, text_left: str, text_main: str, text_right: str):
+            right_edge = (self.screen_w - 5) if self.scrollbar else (self.screen_w - 2)
+            rw = _px_w(text_right) if text_right else 0
+            right_x = max(56, right_edge - rw) if text_right else right_edge
+            # Left + Main column hard clip limit: guarantees >=4px clean gap before Column 2 (`text_right`) so columns NEVER overlap!
+            col1_limit = (right_x - 4) if text_right else right_edge
+            if text_left:
+                self.display.draw_text(0, y_pos, text_left)
+                left_x = _px_w(text_left)
+            else:
+                left_x = 0
+            if text_main and left_x < col1_limit - 4:
+                self.display.draw_text(left_x, y_pos, text_main)
+                if _px_w(text_main) + left_x > col1_limit:
+                    self.display.draw.rectangle((col1_limit, max(0, y_pos), self.screen_w - 1, min(self.screen_h - 1, y_pos + self.font_h - 1)), fill=0)
+            if text_right:
+                self.display.draw.rectangle((max(0, right_x - 2), max(0, y_pos), right_edge, min(self.screen_h - 1, y_pos + self.font_h - 1)), fill=0)
+                self.display.draw_text(right_x, y_pos, text_right)
+
+        # 1. Flexible Body (Supports smooth high-FPS sub-row pixel scrolling + pixel-exact 2-column separation!)
         if self.full_scroll_lines is not None and self.scroll_px is not None:
             px_off = float(self.scroll_px)
             first_idx = max(0, int(px_off // self.font_h))
@@ -53,19 +81,8 @@ class LayoutEngine:
                 if current_y >= end_y:
                     break
                 if current_y + self.font_h > start_y:
-                    text_left, text_main, text_right = self.full_scroll_lines[row_idx]
-                    if text_left:
-                        self.display.draw_text(0, current_y, text_left)
-                        left_x = len(text_left) * 6
-                    else:
-                        left_x = 0
-                    if text_main:
-                        self.display.draw_text(left_x, current_y, text_main)
-                    if text_right:
-                        right_x = self.screen_w - 6 - (len(text_right) * 6)
-                        if self.scrollbar:
-                            right_x -= 4
-                        self.display.draw_text(right_x, current_y, text_right)
+                    tl, tm, tr = self.full_scroll_lines[row_idx]
+                    _draw_row_2col(current_y, tl, tm, tr)
                 current_y += self.font_h
             if start_y > 0:
                 self.display.draw.rectangle((0, 0, self.screen_w - 1, start_y - 1), fill=0)
@@ -73,21 +90,10 @@ class LayoutEngine:
                 self.display.draw.rectangle((0, end_y, self.screen_w - 1, self.screen_h - 1), fill=0)
         else:
             current_y = start_y
-            for text_left, text_main, text_right in self.body_lines:
+            for tl, tm, tr in self.body_lines:
                 if current_y + self.font_h > end_y:
                     break
-                if text_left:
-                    self.display.draw_text(0, current_y, text_left)
-                    left_x = len(text_left) * 6
-                else:
-                    left_x = 0
-                if text_main:
-                    self.display.draw_text(left_x, current_y, text_main)
-                if text_right:
-                    right_x = self.screen_w - 6 - (len(text_right) * 6)
-                    if self.scrollbar:
-                        right_x -= 4
-                    self.display.draw_text(right_x, current_y, text_right)
+                _draw_row_2col(current_y, tl, tm, tr)
                 current_y += self.font_h
 
         # 2. Header (Top Anchor + Optional Fixed Top-Right Battery Badge)

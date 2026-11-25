@@ -36,12 +36,13 @@ class AmbientStarsScene(ScenePlugin):
                     self.display.draw.rectangle((sx, sy, sx + 1, sy + 1), fill=1)
                 else:
                     self.display.draw.point((sx, sy), fill=1)
-        if random.random() < (0.04 * dt) and len(self.app.meteors) < 4:
-            self.app.meteors.append([float(random.randint(30, 124)), float(random.randint(2, 20)), -4.2, 2.4, 10.0])
+        if random.random() < (0.026 * dt) and len(self.app.meteors) < 3:
+            self.app.meteors.append([float(random.randint(34, 124)), float(random.randint(2, 20)), -2.4, 1.35, 16.0])
         m_alive = []
         for m in self.app.meteors:
             mx, my, vx, vy, life = m
-            self.display.draw.line((int(mx), int(my), int(mx - vx * 2.2), int(my - vy * 2.2)), fill=1)
+            tail_k = 2.6 if life > 5.0 else max(0.8, life * 0.5)
+            self.display.draw.line((int(mx), int(my), int(mx - vx * tail_k), int(my - vy * tail_k)), fill=1)
             m[0] += vx * dt
             m[1] += vy * dt
             m[4] -= dt

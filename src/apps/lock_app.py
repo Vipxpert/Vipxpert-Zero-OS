@@ -145,13 +145,14 @@ class LockScreenApp(BaseApp):
         if getattr(self, "_phys_ready", False):
             return
         self._phys_ready = True
-        drop_n = max(1, min(10, int(self.ui.db.get_setting("scn_pond_drops", "4"))))
-        self.pond_ripples = [[64.0, 36.0, 4.0, 28.0], [32.0, 44.0, 12.0, 24.0]]
-        self.pond_drops = [[random.randint(8, 120), random.randint(0, 24), random.randint(24, 48)] for _ in range(drop_n)]
-        self.pond_ripple_spd = float(self.ui.db.get_setting("scn_pond_spd", "1.15"))
+        raw_dn = self.ui.db.get_setting("scn_pond_drops", "2")
+        drop_n = 2 if raw_dn in ("4", "5") else max(1, min(8, int(raw_dn)))
+        self.pond_ripples = [[64.0, 36.0, 6.0, 44.0]]
+        self.pond_drops = [[random.randint(14, 114), float(-i * 18 - random.randint(0, 10)), random.randint(22, 50)] for i in range(drop_n)]
+        self.pond_ripple_spd = float(self.ui.db.get_setting("scn_pond_spd", "1.85"))
         self.pond_storm = 0
         self.star_cx, self.star_cy = 64.0, 32.0
-        self.star_speed = float(self.ui.db.get_setting("scn_star_spd", "1.5"))
+        self.star_speed = float(self.ui.db.get_setting("scn_star_spd", "0.85"))
         self.stars_3d = [[random.uniform(-60, 60), random.uniform(-32, 32), random.uniform(4, 64)] for _ in range(36)]
         self.meteors = []
         b_spd = float(self.ui.db.get_setting("scn_bnc_spd", "1.8"))
@@ -162,9 +163,9 @@ class LockScreenApp(BaseApp):
         self.bnc_walls = 0
         self.bnc_corners = 0
         self.bnc_flash = 0
-        self.grass_wind = float(self.ui.db.get_setting("scn_grass_wind", "0.8"))
+        self.grass_wind = float(self.ui.db.get_setting("scn_grass_wind", "1.35"))
         self.grass_target_wind = self.grass_wind
-        self.grass_height = int(self.ui.db.get_setting("scn_grass_ht", "22"))
+        self.grass_height = int(self.ui.db.get_setting("scn_grass_ht", "14"))
         self.fireflies = [[random.uniform(6, 122), random.uniform(8, 42), random.uniform(0, 6.28)] for _ in range(6)]
 
     def _get_enabled_slots(self):
@@ -1681,6 +1682,13 @@ finally:
                         return
                     idx = ids.index(self.standalone_scene) if self.standalone_scene in ids else 0
                     step = 1 if key == "B" else -1
+                    if not self.ui.is_minimal_ui() and self.ui.db.get_setting("ui_scene_scroll", "1") != "0":
+                        try:
+                            self._scn_prev_img = self.display.image.copy()
+                            self._scn_trans_ts = time.monotonic()
+                            self._scn_trans_dir = step
+                        except Exception:
+                            self._scn_prev_img = None
                     self.standalone_scene = ids[(idx + step) % len(ids)]
                     if parent_app and getattr(parent_app, "current_menu", "") == "lock_cat_scenes" and self.standalone_scene in ids:
                         parent_app.cursor_index = ids.index(self.standalone_scene)
@@ -1701,6 +1709,13 @@ finally:
                 if len(slots) > 1:
                     idx = slots.index(self.active_slot) if self.active_slot in slots else 0
                     step = 1 if key == "B" else -1
+                    if not self.ui.is_minimal_ui() and self.ui.db.get_setting("ui_scene_scroll", "1") != "0":
+                        try:
+                            self._scn_prev_img = self.display.image.copy()
+                            self._scn_trans_ts = time.monotonic()
+                            self._scn_trans_dir = step
+                        except Exception:
+                            self._scn_prev_img = None
                     self.active_slot = slots[(idx + step) % len(slots)]
                 self.manual_override = True
                 self.last_cycle_tick = now
@@ -2276,6 +2291,28 @@ finally:
         plugin = SceneManager.get_instance(scene_id, self.display, self.ui, self)
         if plugin:
             plugin.draw()
+        prev_scn = getattr(self, "_scn_prev_img", None)
+        if prev_scn is not None:
+            el_s = time.monotonic() - getattr(self, "_scn_trans_ts", 0.0)
+            dur_s = 0.20
+            if el_s >= dur_s or self.ui.is_minimal_ui():
+                self._scn_prev_img = None
+            else:
+                u_s = max(0.0, min(1.0, el_s / dur_s))
+                p_s = 1.0 - ((1.0 - u_s) ** 3)
+                d_dir = getattr(self, "_scn_trans_dir", 1)
+                shift = int(round(128.0 * p_s))
+                new_im = self.display.image.copy()
+                self.display.draw.rectangle((0, 0, 127, 63), fill=0)
+                if d_dir >= 0:
+                    # B (Next): slide left
+                    self.display.image.paste(prev_scn, (-shift, 0))
+                    self.display.image.paste(new_im, (128 - shift, 0))
+                else:
+                    # A (Prev): slide right
+                    self.display.image.paste(prev_scn, (shift, 0))
+                    self.display.image.paste(new_im, (shift - 128, 0))
+                self.display.has_active_marquee = True
         t2 = time.monotonic()
         self._apply_hud_and_banner_fx(scene_id)
         t3 = time.monotonic()
@@ -2284,110 +2321,8 @@ finally:
         self._prof_hud_ms = round((t3 - t2) * 1000.0, 2)
 
     def _draw_pill_with_fx(self, text_s: str, pos: str, alpha: float, anchor_cfg: str, fx_mode: str, is_guide: bool = False):
-        """
-        Renders a tight-fitted pill at pos ('top' or 'bottom') anchored at Left ★ / Center / Right
-        with per-line text alignment, a 2px left HUD accent bar on 2-line Guide Cards,
-        and 'bayer' 4x4 dissolve / 'curtain' slide / 'laser' wipe transitions.
-        """
-        if not text_s or alpha <= 0.02:
-            return
-        raw_lines = [ln.strip()[:20] for ln in text_s.replace("\n", "|").split("|") if ln.strip()]
-        if not raw_lines:
-            return
-        lines = raw_lines[:5] if is_guide else raw_lines[:1]
-        n_lines = len(lines)
-        pad = 4 if is_guide else 6
-
-        line_widths = []
-        max_w_px = 12
-        for ln in lines:
-            try:
-                bb = self.display.draw.textbbox((0, 0), ln, font=self.display.font_small)
-                w_px = max(12, bb[2] - bb[0])
-            except Exception:
-                w_px = len(ln) * 6
-            line_widths.append(w_px)
-            if w_px > max_w_px:
-                max_w_px = w_px
-
-        box_w = min(126, max_w_px + pad * 2)
-        if anchor_cfg == "center":
-            x0 = max(1, (128 - box_w) // 2)
-        elif anchor_cfg == "right":
-            x0 = max(1, 126 - box_w)
-        else:
-            x0 = 1 if is_guide else 2
-        x1 = min(126, x0 + box_w)
-
-        def _line_x(idx_l: int) -> int:
-            lw = line_widths[idx_l]
-            if anchor_cfg == "center":
-                return max(x0 + 3, x0 + ((x1 - x0) - lw) // 2)
-            if anchor_cfg == "right":
-                return max(x0 + 3, x1 - pad - lw)
-            return x0 + pad
-
-        box_h = 12 if n_lines == 1 else min(62, 3 + n_lines * 10)
-        if pos == "top":
-            y_base0, y_base1 = 0, box_h - 1
-        else:
-            y_base0, y_base1 = max(0, 64 - box_h), 63
-
-        if fx_mode == "curtain":
-            y_off = int((1.0 - alpha) * float(box_h))
-            y0 = (y_base0 - y_off) if pos == "top" else (y_base0 + y_off)
-            y1 = (y_base1 - y_off) if pos == "top" else (y_base1 + y_off)
-            if y1 < 0 or y0 >= 64:
-                return
-            yc0, yc1 = max(0, y0), min(63, y1)
-            if is_guide:
-                self.display.draw.rectangle((x0, yc0, x1, yc1), fill=0, outline=1)
-                self.display.draw.rectangle((x0, yc0, min(x1, x0 + 2), yc1), fill=1)
-                for idx, ln in enumerate(lines):
-                    ty = y0 + 2 + idx * 10
-                    if 0 <= ty <= 55:
-                        self.display.draw.text((_line_x(idx), ty), ln, font=self.display.font_small, fill=1)
-            else:
-                self.display.draw.rectangle((x0, yc0, x1, yc1), fill=1)
-                self.display.draw.text((_line_x(0), y0 + 1), lines[0], font=self.display.font_small, fill=0)
-            return
-
-        if fx_mode == "laser":
-            mid_x = (x0 + x1) // 2
-            half_w = int(alpha * ((x1 - x0) * 0.5))
-            if half_w <= 2:
-                return
-            lx0, lx1 = max(0, mid_x - half_w), min(127, mid_x + half_w)
-            if is_guide:
-                self.display.draw.rectangle((lx0, y_base0, lx1, y_base1), fill=0, outline=1)
-                if alpha > 0.40:
-                    for idx, ln in enumerate(lines):
-                        self.display.draw.text((max(lx0 + 2, _line_x(idx)), y_base0 + 2 + idx * 10), ln, font=self.display.font_small, fill=1)
-            else:
-                self.display.draw.rectangle((lx0, y_base0, lx1, y_base1), fill=1)
-                if alpha > 0.40:
-                    self.display.draw.text((max(lx0 + 2, _line_x(0)), y_base0 + 1), lines[0], font=self.display.font_small, fill=0)
-            return
-
-        # Default 'bayer': Draw 1-line Title pill or 2-line Guide card (with 2px left accent bar), then erode via 4x4 Bayer matrix
-        self.display.draw.rectangle((max(0, x0 - 1), max(0, y_base0 - 1), min(127, x1 + 1), min(63, y_base1 + 1)), fill=0)
-        if is_guide:
-            self.display.draw.rectangle((x0, y_base0, x1, y_base1), fill=0, outline=1)
-            self.display.draw.rectangle((x0, y_base0, min(x1, x0 + 2), y_base1), fill=1)
-            for idx, ln in enumerate(lines):
-                self.display.draw.text((_line_x(idx), y_base0 + 2 + idx * 10), ln, font=self.display.font_small, fill=1)
-        else:
-            self.display.draw.rectangle((x0, y_base0, x1, y_base1), fill=1)
-            self.display.draw.text((_line_x(0), y_base0 + 1), lines[0], font=self.display.font_small, fill=0)
-
-        if alpha < 0.99:
-            thresh = int(round(alpha * 16.0))
-            px = self.display.image.load()
-            for y in range(y_base0, y_base1 + 1):
-                b_row = _BAYER_4X4[y & 3]
-                for x in range(x0, x1 + 1):
-                    if b_row[x & 3] >= thresh:
-                        px[x, y] = 0
+        """Delegates Lock Screen scene-switch & guide pills to single-source UIManager.draw_fx_pill()."""
+        self.ui.draw_fx_pill(text_s, pos=pos, alpha=alpha, anchor_cfg=anchor_cfg, fx_mode=fx_mode, is_guide=is_guide)
 
     def _apply_hud_and_banner_fx(self, scene_id: str):
         # HUD Banner Overlay Compositor (Applies intro/guide pills and Bayer fade transitions over active scene)

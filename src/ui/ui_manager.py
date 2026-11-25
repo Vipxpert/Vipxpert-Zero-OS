@@ -34,6 +34,12 @@ class UIManager:
         self._toast_expire_ts = 0.0
         self._toast_birth_ts = 0.0
         self._toast_blocking = False
+        self._toast_owner = None
+        self._trans_prev_img = None
+        self._trans_start_ts = 0.0
+        self._trans_dur = 0.18
+        self._trans_kind = "iris"
+        self.app_snapshots = {}
         self.hw_profile = {"tier": "full", "cores": 4, "dsp_cores": "0,2"}
 
         # Compositor V-Sync State (Apply hardware I2C0 clock profile & marquee speed immediately on boot)
@@ -1123,65 +1129,195 @@ class UIManager:
         """Flags the compositor that a visual state change occurred."""
         self.needs_render = True
 
-    # Stage: Universal Compositor Toast (Single-source top-Z toast overlay across all menus, apps, and 3-phase PWM scenes)
-    def show_toast(self, message: str, duration: float = 1.35, blocking: bool = False):
+    # Stage: Universal DRY Pill & Compositor Toast Engine (Shared across all menus, IR/Wi-Fi/BT blocking tasks, and Lock Screen scene HUDs)
+    _BAYER_4X4 = ((0, 8, 2, 10), (12, 4, 14, 6), (3, 11, 1, 9), (15, 7, 13, 5))
+
+    def show_toast(self, message: str, duration: float = 1.35, blocking: bool = False, owner=None):
         now = time.monotonic()
         self._toast_message = str(message) if message else None
         self._toast_birth_ts = now
-        self._toast_expire_ts = (now + 3600.0) if blocking else (now + max(0.35, float(duration)))
+        # Cap blocking safety TTL at 25s AND track owner so finishing work or switching apps auto-clears universally!
+        self._toast_expire_ts = (now + 25.0) if blocking else (now + max(0.35, float(duration)))
         self._toast_blocking = bool(blocking)
+        self._toast_owner = (owner if owner is not None else self.current_app) if blocking else None
         self.needs_render = True
 
     def clear_toast(self):
         if self._toast_message is not None:
             self._toast_message = None
             self._toast_blocking = False
+            self._toast_owner = None
             self.needs_render = True
+
+    def draw_fx_pill(
+        self,
+        text_s: str,
+        pos: str = "bottom",
+        alpha: float = 1.0,
+        anchor_cfg: str = "center",
+        fx_mode: str = "bayer",
+        is_guide: bool = True,
+        y_override: Optional[int] = None,
+    ):
+        """
+        Single-source DRY HUD Pill & Toast renderer shared by UIManager universal toasts AND LockScreenApp scene-switch banners.
+        Supports 'bayer' 4x4 dissolve, 'curtain' vertical slide, and 'laser' horizontal wipe.
+        """
+        if not text_s or alpha <= 0.02:
+            return None
+        raw_lines = [ln.strip()[:21] for ln in text_s.replace("\n", "|").split("|") if ln.strip()]
+        if not raw_lines:
+            return None
+        lines = raw_lines[:5] if is_guide else raw_lines[:1]
+        n_lines = len(lines)
+        pad = 5 if is_guide else 6
+        font = self.display.font_small
+
+        line_widths = []
+        max_w_px = 14
+        for ln in lines:
+            try:
+                bb = self.display.draw.textbbox((0, 0), ln, font=font)
+                w_px = max(14, bb[2] - bb[0])
+            except Exception:
+                w_px = len(ln) * 6
+            line_widths.append(w_px)
+            if w_px > max_w_px:
+                max_w_px = w_px
+
+        box_w = min(126, max_w_px + pad * 2)
+        if anchor_cfg == "center":
+            x0 = max(1, (128 - box_w) // 2)
+        elif anchor_cfg == "right":
+            x0 = max(1, 126 - box_w)
+        else:
+            x0 = 1 if is_guide else 2
+        x1 = min(126, x0 + box_w)
+
+        def _line_x(idx_l: int) -> int:
+            lw = line_widths[idx_l]
+            if anchor_cfg == "center":
+                return max(x0 + 3, x0 + ((x1 - x0) - lw) // 2)
+            if anchor_cfg == "right":
+                return max(x0 + 3, x1 - pad - lw)
+            return x0 + pad
+
+        box_h = 13 if n_lines == 1 else min(62, 3 + n_lines * 10)
+        if y_override is not None:
+            y_base0 = max(0, min(64 - box_h, int(y_override)))
+            y_base1 = min(63, y_base0 + box_h - 1)
+        elif pos == "top":
+            y_base0, y_base1 = 0, box_h - 1
+        else:
+            y_base0, y_base1 = max(0, 64 - box_h), 63
+
+        if fx_mode == "curtain":
+            y_off = int((1.0 - alpha) * float(box_h))
+            y0 = (y_base0 - y_off) if pos == "top" else (y_base0 + y_off)
+            y1 = (y_base1 - y_off) if pos == "top" else (y_base1 + y_off)
+            if y1 < 0 or y0 >= 64:
+                return None
+            yc0, yc1 = max(0, y0), min(63, y1)
+            self.display.draw.rectangle((max(0, x0 - 1), max(0, yc0 - 1), min(127, x1 + 1), min(63, yc1 + 1)), fill=0)
+            if is_guide:
+                self.display.draw.rectangle((x0, yc0, x1, yc1), fill=0, outline=1)
+                self.display.draw.rectangle((x0, yc0, min(x1, x0 + 2), yc1), fill=1)
+                for idx, ln in enumerate(lines):
+                    ty = y0 + (1 if n_lines == 1 else 2) + idx * 10
+                    if 0 <= ty <= 55:
+                        self.display.draw.text((_line_x(idx), ty), ln, font=font, fill=1)
+            else:
+                self.display.draw.rectangle((x0, yc0, x1, yc1), fill=1)
+                self.display.draw.text((_line_x(0), y0 + 1), lines[0], font=font, fill=0)
+            return (yc0, yc1)
+
+        if fx_mode == "laser":
+            mid_x = (x0 + x1) // 2
+            half_w = int(alpha * ((x1 - x0) * 0.5))
+            if half_w <= 2:
+                return None
+            lx0, lx1 = max(0, mid_x - half_w), min(127, mid_x + half_w)
+            self.display.draw.rectangle((max(0, lx0 - 1), max(0, y_base0 - 1), min(127, lx1 + 1), min(63, y_base1 + 1)), fill=0)
+            if is_guide:
+                self.display.draw.rectangle((lx0, y_base0, lx1, y_base1), fill=0, outline=1)
+                self.display.draw.rectangle((lx0, y_base0, min(lx1, lx0 + 2), y_base1), fill=1)
+                if alpha > 0.40:
+                    for idx, ln in enumerate(lines):
+                        self.display.draw.text((max(lx0 + 3, _line_x(idx)), y_base0 + (1 if n_lines == 1 else 2) + idx * 10), ln, font=font, fill=1)
+            else:
+                self.display.draw.rectangle((lx0, y_base0, lx1, y_base1), fill=1)
+                if alpha > 0.40:
+                    self.display.draw.text((max(lx0 + 2, _line_x(0)), y_base0 + 1), lines[0], font=font, fill=0)
+            return (y_base0, y_base1)
+
+        self.display.draw.rectangle((max(0, x0 - 1), max(0, y_base0 - 1), min(127, x1 + 1), min(63, y_base1 + 1)), fill=0)
+        if is_guide:
+            self.display.draw.rectangle((x0, y_base0, x1, y_base1), fill=0, outline=1)
+            self.display.draw.rectangle((x0, y_base0, min(x1, x0 + 2), y_base1), fill=1)
+            for idx, ln in enumerate(lines):
+                self.display.draw.text((_line_x(idx), y_base0 + (1 if n_lines == 1 else 2) + idx * 10), ln, font=font, fill=1)
+        else:
+            self.display.draw.rectangle((x0, y_base0, x1, y_base1), fill=1)
+            self.display.draw.text((_line_x(0), y_base0 + 1), lines[0], font=font, fill=0)
+
+        if alpha < 0.99:
+            thresh = int(round(alpha * 16.0))
+            px = self.display.image.load()
+            for y in range(y_base0, y_base1 + 1):
+                b_row = self._BAYER_4X4[y & 3]
+                for x in range(x0, x1 + 1):
+                    if b_row[x & 3] >= thresh:
+                        px[x, y] = 0
+        return (y_base0, y_base1)
 
     def _render_universal_toast(self):
         msg = self._toast_message
         if not msg:
             return
         now = time.monotonic()
-        if not self._toast_blocking and now >= self._toast_expire_ts:
-            self._toast_message = None
-            self.needs_render = True
-            return
-
-        rem = self._toast_expire_ts - now
-        if rem < 0.45 and not self._toast_blocking:
-            self.display.has_active_marquee = True
+        # Comment (invariant): Universal Blocking-Toast Auto-Clear — legacy apps (IR Wi-Fi Restore/Disable, Bluetooth, Hotspot, CrudListApp) reset `self.is_working = False` or call `switch_app()` in `finally:` without calling `ui.clear_toast()`; auto-clearing whenever the spawning owner is no longer working or no longer mounted eliminates stuck blocking toasts across the entire OS!
+        if self._toast_blocking:
+            owner = self._toast_owner
+            if now >= self._toast_expire_ts or (
+                owner is not None and (owner is not self.current_app or not getattr(owner, "is_working", True))
+            ):
+                self.clear_toast()
+                return
+            alpha = min(1.0, (now - self._toast_birth_ts) / 0.14) if (now - self._toast_birth_ts) < 0.14 else 1.0
+            if alpha < 1.0:
+                self.display.has_active_marquee = True
         else:
-            # Schedule deterministic wake right when toast expires so static screens clear it with 0 lag
-            nxt_w = getattr(self.display, 'next_marquee_wake', 0.0)
-            if nxt_w <= 0.0 or self._toast_expire_ts < nxt_w:
-                self.display.next_marquee_wake = self._toast_expire_ts
+            if now >= self._toast_expire_ts:
+                self.clear_toast()
+                return
+            age = now - self._toast_birth_ts
+            rem = self._toast_expire_ts - now
+            if age < 0.14:
+                alpha = max(0.15, age / 0.14)
+                self.display.has_active_marquee = True
+            elif rem < 0.28:
+                alpha = max(0.08, rem / 0.28)
+                self.display.has_active_marquee = True
+            else:
+                alpha = 1.0
+                nxt_w = getattr(self.display, 'next_marquee_wake', 0.0)
+                fade_start = self._toast_expire_ts - 0.28
+                if nxt_w <= 0.0 or fade_start < nxt_w:
+                    self.display.next_marquee_wake = max(now + 0.02, fade_start)
 
-        line = msg.strip()[:20]
-        font = self.display.font_small
-        try:
-            bb = self.display.draw.textbbox((0, 0), line, font=font)
-            tw = max(16, bb[2] - bb[0])
-        except Exception:
-            tw = len(line) * 6
-        box_w = min(124, tw + 10)
-        x0 = max(2, (128 - box_w) // 2)
-        x1 = min(125, x0 + box_w)
-        y0, y1 = 49, 62
-        tx = x0 + max(3, (box_w - tw) // 2)
-
-        # Crisp bordered high-contrast HUD toast pill + 2px left accent bar
-        self.display.draw.rectangle((max(0, x0 - 1), y0 - 1, min(127, x1 + 1), min(63, y1 + 1)), fill=0)
-        self.display.draw.rectangle((x0, y0, x1, y1), fill=0, outline=1)
-        self.display.draw.rectangle((x0, y0, min(x1, x0 + 2), y1), fill=1)
-        self.display.draw.text((tx, y0 + 1), line, font=font, fill=1)
-
+        fx_mode = self.db.get_setting("lock_hud_fx", "bayer")
+        span = self.draw_fx_pill(msg, pos="bottom", alpha=alpha, anchor_cfg="center", fx_mode=fx_mode, is_guide=True, y_override=49)
         # Comment (invariant): Mirror active universal toast strip onto _pwm_gray_planes (ph1/lo) whenever 3-phase PWM shading is active on the frame so grayscale savers/visualizers never flicker through the toast box.
         gp = getattr(self.display, '_pwm_gray_planes', None)
-        if gp is not None:
-            band = self.display.image.crop((0, y0 - 1, 128, 64))
-            gp[0].paste(band, (0, y0 - 1))
-            gp[1].paste(band, (0, y0 - 1))
+        if gp is not None and span is not None:
+            yb0 = max(0, span[0] - 1)
+            band = self.display.image.crop((0, yb0, 128, 64))
+            gp[0].paste(band, (0, yb0))
+            gp[1].paste(band, (0, yb0))
+
+    def is_minimal_ui(self) -> bool:
+        """Master Minimal Mode flag: when enabled, disables all transitions, smooth scrolling, styled App Launcher, and Modern Recent cards."""
+        return self.db.get_setting("ui_minimal_mode", "0") == "1"
 
     def draw_top_right_battery(self) -> bool:
         """Single-source DRY top-right battery percentage badge ('88%' or '+88%') with clean black left mask."""
@@ -1227,6 +1363,57 @@ class UIManager:
                 print(f"[Compositor] Overlay _draw_state error: {e}", flush=True)
                 traceback.print_exc()
 
+        # 2.5 Reversible App Launch & Screen Lock Transition Layer ('iris' ★ / 'bayer' / 'curtain' / 'off')
+        prev_im = getattr(self, "_trans_prev_img", None)
+        if prev_im is not None:
+            el_tr = time.monotonic() - self._trans_start_ts
+            if el_tr >= self._trans_dur:
+                self._trans_prev_img = None
+            else:
+                u_tr = max(0.0, min(1.0, el_tr / self._trans_dur))
+                # Ease-out cubic so transitions feel snappy and never delay input!
+                p_tr = 1.0 - ((1.0 - u_tr) ** 3)
+                self.display.has_active_marquee = True
+                kind = self._trans_kind
+                if kind == "curtain":
+                    split_y = int(round(p_tr * 64.0))
+                    if split_y < 64:
+                        tail = prev_im.crop((0, split_y, 128, 64))
+                        self.display.image.paste(tail, (0, split_y))
+                        if 0 < split_y < 63:
+                            self.display.draw.line((0, split_y, 127, split_y), fill=1)
+                elif kind == "bayer":
+                    thresh = int(round(p_tr * 16.0))
+                    dst_px = self.display.image.load()
+                    src_px = prev_im.load()
+                    for y in range(64):
+                        brow = self._BAYER_4X4[y & 3]
+                        for x in range(128):
+                            if brow[x & 3] >= thresh:
+                                dst_px[x, y] = src_px[x, y]
+                elif kind == "zoom":
+                    # Card-to-fullscreen zoom expansion from RecentApp's 72x36 center card (28,15..100,51) -> (0,0..128,64)
+                    cw = max(72, int(round(72.0 + (128.0 - 72.0) * p_tr)))
+                    ch = max(36, int(round(36.0 + (64.0 - 36.0) * p_tr)))
+                    cx0 = max(0, (128 - cw) // 2)
+                    cy0 = max(0, int(round(15.0 * (1.0 - p_tr))))
+                    scaled = self.display.image.resize((cw, ch))
+                    self.display.image.paste(prev_im, (0, 0))
+                    self.display.image.paste(scaled, (cx0, cy0))
+                    if cw < 126 or ch < 62:
+                        self.display.draw.rectangle((cx0, cy0, min(127, cx0 + cw - 1), min(63, cy0 + ch - 1)), outline=1)
+                else:
+                    # 'iris': sleek center-expanding rectangular portal frame
+                    hw = int(round(p_tr * 64.0))
+                    hh = int(round(p_tr * 32.0))
+                    ix0, ix1 = 64 - hw, 64 + hw
+                    iy0, iy1 = 32 - hh, 32 + hh
+                    new_crop = self.display.image.crop((max(0, ix0), max(0, iy0), min(128, ix1), min(64, iy1)))
+                    self.display.image.paste(prev_im, (0, 0))
+                    self.display.image.paste(new_crop, (max(0, ix0), max(0, iy0)))
+                    if 2 < hw < 63 and 2 < hh < 31:
+                        self.display.draw.rectangle((ix0, iy0, ix1 - 1, iy1 - 1), outline=1)
+
         # 3. Universal Top-Z Toast Layer (Shared by all menus, apps, and Lock Screen scenes)
         self._render_universal_toast()
 
@@ -1239,8 +1426,13 @@ class UIManager:
         self.needs_render = False
 
     async def suspend_current(self):
-        """Pushes the current app to the background without destroying it."""
+        """Pushes the current app to the background without destroying it and caches its 1-bit screencap."""
         if self.current_app_id and self.current_app:
+            if self.current_app_id not in ('home', 'recent_tab', 'app_selector', 'task_mgr_root', 'task_mgr_list', 'confirm_modal', 'lock_screen'):
+                try:
+                    self.app_snapshots[self.current_app_id] = self.display.image.copy()
+                except Exception:
+                    pass
             self.previous_app_id = self.current_app_id
             self.current_app = None
 
@@ -1252,6 +1444,7 @@ class UIManager:
                 await app_to_kill.on_stop()
 
             del self.active_apps[app_id]
+            self.app_snapshots.pop(app_id, None)
 
             # If we just killed the app we are currently looking at
             if self.current_app_id == app_id:
@@ -1262,6 +1455,23 @@ class UIManager:
         """Mounts an app by ID, pulling from background cache if alive, or registers a new one."""
         # Capture the ID of the app we are leaving before we suspend it
         previous_app_id = getattr(self, 'current_app_id', None)
+
+        # Auto-clear any lingering blocking toast owned by the departing app (e.g. IR 'Restoring...' / Wi-Fi / BT)
+        if self._toast_blocking:
+            self.clear_toast()
+
+        # Snapshot current 1-bit frame for reversible App Launch / Screen Lock / Unlock transition (unless set to 'off')
+        tr_cfg = "off" if self.is_minimal_ui() else self.db.get_setting("ui_transition_fx", "iris")
+        if tr_cfg == "off" or getattr(self, "is_screen_off", False):
+            self._trans_prev_img = None
+        elif previous_app_id is not None and previous_app_id != app_id:
+            try:
+                self._trans_prev_img = self.display.image.copy()
+                self._trans_start_ts = time.monotonic()
+                self._trans_kind = tr_cfg
+                self._trans_dur = 0.24 if (app_id == "lock_screen" or previous_app_id == "lock_screen") else 0.16
+            except Exception:
+                self._trans_prev_img = None
 
         # 1. Suspend the currently running app
         await self.suspend_current()
@@ -1355,6 +1565,16 @@ class UIManager:
                     if action == 'HOLD':
                         self._wake_key_active = False
                         self.db.set_setting("is_locked", "False")
+                        # Comment (order): Capture Lock Screen frame BEFORE destroy_app('lock_screen') sets current_app_id=None, otherwise switch_app() sees previous_app_id=None and skips the Unlock transition!
+                        tr_cfg = "off" if self.is_minimal_ui() else self.db.get_setting("ui_transition_fx", "iris")
+                        if tr_cfg != "off":
+                            try:
+                                self._trans_prev_img = self.display.image.copy()
+                                self._trans_start_ts = time.monotonic()
+                                self._trans_kind = tr_cfg
+                                self._trans_dur = 0.24
+                            except Exception:
+                                self._trans_prev_img = None
                         await self.destroy_app('lock_screen')
 
                         target = self.previous_app_id

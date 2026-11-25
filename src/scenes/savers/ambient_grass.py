@@ -30,10 +30,10 @@ class AmbientGrassScene(ScenePlugin):
         h_base = self.app.grass_height
         for i in range(32):
             gx = 2 + i * 4
-            b_h = h_base + ((i * 7) % 9) - 4
-            gust = math.sin(ph * 0.11 + i * 0.35) * 3.5 + self.app.grass_wind * 6.0
+            b_h = max(7, h_base + ((i * 7) % 7) - 3)
+            gust = math.sin(ph * 0.21 + i * 0.38) * 3.8 + math.sin(ph * 0.37 + i * 0.8) * 1.4 + self.app.grass_wind * 4.8
             mx, my = int(gx + gust * 0.45), 62 - (b_h // 2)
-            tx, ty = int(gx + gust), max(4, 62 - b_h + int(abs(gust) * 0.25))
+            tx, ty = int(gx + gust), max(4, 62 - b_h + int(abs(gust) * 0.22))
             self.display.draw.line((gx, 62, mx, my), fill=1)
             self.display.draw.line((mx, my, tx, ty), fill=1)
         ph_i = int(ph)
