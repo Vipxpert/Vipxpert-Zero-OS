@@ -125,11 +125,14 @@ class Display:
         self.dither_lo = 42
         self.dither_hi = 70
         self.dither_ramp = True
+        self.pwm_t0 = 48
+        self.pwm_t1 = 128
+        self.pwm_t2 = 208
         try:
             import sqlite3 as _sq
             with _sq.connect("/home/vipxpert/vipxpert_minimal_os/vipxpert_os.db") as _c:
                 _rows = dict(_c.execute(
-                    "SELECT key, value FROM settings WHERE key IN ('oled_pwm_dt','oled_gray_mode','oled_dither_algo','oled_dither_lo','oled_dither_hi','oled_dither_ramp');"
+                    "SELECT key, value FROM settings WHERE key IN ('oled_pwm_dt','oled_gray_mode','oled_dither_algo','oled_dither_lo','oled_dither_hi','oled_dither_ramp','oled_pwm_t0','oled_pwm_t1','oled_pwm_t2');"
                 ).fetchall())
                 if "oled_pwm_dt" in _rows and 0.004 < float(_rows["oled_pwm_dt"]) < 0.012:
                     init_dt = float(_rows["oled_pwm_dt"])
@@ -143,6 +146,12 @@ class Display:
                     self.dither_hi = max(4, min(96, int(_rows["oled_dither_hi"])))
                 if "oled_dither_ramp" in _rows:
                     self.dither_ramp = (_rows["oled_dither_ramp"] != "0")
+                if "oled_pwm_t0" in _rows:
+                    self.pwm_t0 = max(1, min(250, int(_rows["oled_pwm_t0"])))
+                if "oled_pwm_t1" in _rows:
+                    self.pwm_t1 = max(self.pwm_t0 + 1, min(252, int(_rows["oled_pwm_t1"])))
+                if "oled_pwm_t2" in _rows:
+                    self.pwm_t2 = max(self.pwm_t1 + 1, min(254, int(_rows["oled_pwm_t2"])))
         except Exception:
             pass
         self._pwm_base_dt = init_dt
@@ -1272,7 +1281,7 @@ class Display:
             except Exception:
                 pass
 
-    def set_gray_engine_config(self, gray_mode: str = None, dither_algo: str = None, dither_lo: int = None, dither_hi: int = None, dither_ramp: bool = None):
+    def set_gray_engine_config(self, gray_mode: str = None, dither_algo: str = None, dither_lo: int = None, dither_hi: int = None, dither_ramp: bool = None, pwm_t0: int = None, pwm_t1: int = None, pwm_t2: int = None):
         """Updates universal Gray Engine parameters live and invalidates cached dither tiles/LUTs."""
         if gray_mode in ("hybrid", "pwm", "dithering", "off"):
             self.gray_mode = gray_mode
@@ -1284,7 +1293,14 @@ class Display:
             self.dither_hi = max(4, min(96, int(dither_hi)))
         if dither_ramp is not None:
             self.dither_ramp = bool(dither_ramp)
+        if pwm_t0 is not None:
+            self.pwm_t0 = max(1, min(250, int(pwm_t0)))
+        if pwm_t1 is not None:
+            self.pwm_t1 = max(getattr(self, "pwm_t0", 48) + 1, min(252, int(pwm_t1)))
+        if pwm_t2 is not None:
+            self.pwm_t2 = max(getattr(self, "pwm_t1", 128) + 1, min(254, int(pwm_t2)))
         self._dither_tile_cache = None
+        self._pwm_gray_luts = None
 
     def _apply_dither_img(self, g_img: Image.Image, algo: str = None, d_lo: int = None, d_hi: int = None, ramp: bool = None) -> Image.Image:
         """Universal 8-bit grayscale -> 1-bit dither engine supporting 7 algorithms with calibrated density LUT."""
@@ -1297,22 +1313,27 @@ class Display:
         lo_v = max(1, min(254, int(round(d_lo * 2.55))))
         hi_v = max(lo_v, min(254, int(round(d_hi * 2.55))))
         cache = getattr(self, "_dither_tile_cache", None)
-        ck = (w, h, algo, lo_v, hi_v, ramp)
+        t0 = max(1, min(250, int(getattr(self, "pwm_t0", 48))))
+        t1 = max(t0 + 1, min(252, int(getattr(self, "pwm_t1", 128))))
+        t2 = max(t1 + 1, min(254, int(getattr(self, "pwm_t2", 208))))
+        ck = (w, h, algo, lo_v, hi_v, ramp, t0, t1, t2)
         if cache is None or cache[0] != ck:
             # Comment (invariant): Anchor Smooth Ramp piecewise-linearly at 85->lo_v and 170->hi_v so 4-shade Dither & Calib (0, 85, 170, 255) matches Hybrid and Dithering identically with zero luminance drift.
             if ramp:
+                a1 = max(t0 + 1, min(85, t1))
+                a2 = min(t2 - 1, max(170, a1 + 1))
                 d_lut = [
-                    0 if p < 48 else (
-                        int((p - 48) * lo_v / 37.0) if p < 85 else (
-                            int(lo_v + (p - 85) * (hi_v - lo_v) / 85.0) if p < 170 else (
-                                int(hi_v + (p - 170) * (255 - hi_v) / 38.0) if p < 208 else 255
+                    0 if p < t0 else (
+                        int((p - t0) * lo_v / float(a1 - t0)) if p < a1 else (
+                            int(lo_v + (p - a1) * (hi_v - lo_v) / float(a2 - a1)) if p < a2 else (
+                                int(hi_v + (p - a2) * (255 - hi_v) / float(t2 - a2)) if p < t2 else 255
                             )
                         )
                     )
                     for p in range(256)
                 ]
             else:
-                d_lut = [0 if p < 48 else (255 if p >= 208 else (lo_v if p < 128 else hi_v)) for p in range(256)]
+                d_lut = [0 if p < t0 else (255 if p >= t2 else (lo_v if p < t1 else hi_v)) for p in range(256)]
             nz_lut = [0] + [255] * 255
             tile_img = None
             if algo == "bayer2":
@@ -1452,16 +1473,21 @@ class Display:
             return
         # Comment (decision): Emit clean 3-phase planes for both 'hybrid' and 'pwm' here; Display.show() enforces the unified SH1106 vertical-page <=176B Hybrid budget across all primitives on the frame.
         luts = getattr(self, "_pwm_gray_luts", None)
-        if luts is None:
+        t0 = max(1, min(250, int(getattr(self, "pwm_t0", 48))))
+        t1 = max(t0 + 1, min(252, int(getattr(self, "pwm_t1", 128))))
+        t2 = max(t1 + 1, min(254, int(getattr(self, "pwm_t2", 208))))
+        tk = (t0, t1, t2)
+        if luts is None or luts[0] != tk:
             luts = (
-                [255 if p >= 48 else 0 for p in range(256)],
-                [255 if p >= 128 else 0 for p in range(256)],
-                [255 if p >= 208 else 0 for p in range(256)],
+                tk,
+                [255 if p >= t0 else 0 for p in range(256)],
+                [255 if p >= t1 else 0 for p in range(256)],
+                [255 if p >= t2 else 0 for p in range(256)],
             )
             self._pwm_gray_luts = luts
-        b_ph0 = g_img.point(luts[0], mode="1")
-        b_ph1 = g_img.point(luts[1], mode="1")
-        b_lo = g_img.point(luts[2], mode="1")
+        b_ph0 = g_img.point(luts[1], mode="1")
+        b_ph1 = g_img.point(luts[2], mode="1")
+        b_lo = g_img.point(luts[3], mode="1")
         # Comment (invariant): Preserve existing _pwm_gray_planes (e.g. from render_wireframe_3d on the same frame) instead of re-snapshotting self.image, so multiple gray primitives on one screen keep all 3 PWM planes intact.
         prev_planes = getattr(self, "_pwm_gray_planes", None)
         self.image.paste(b_ph0, (x0, y0))
