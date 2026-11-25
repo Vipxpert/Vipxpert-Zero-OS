@@ -656,6 +656,88 @@ class AudioSettingsApp(ListMenuApp):
         self._rebuild_menu()
         self.ui.request_render()
 
+    def _get_usb_dac_mixer_state(self, force_refresh: bool = False) -> dict:
+        """Caches discovered USB DAC ALSA hardware mixer state across rapid < > ticks."""
+        import time
+        now = time.monotonic()
+        cached = getattr(self, "_usb_mixer_cache", None)
+        last_ts = getattr(self, "_usb_mixer_cache_ts", 0.0)
+        if force_refresh or cached is None or (now - last_ts) > 2.5:
+            from src.hardware.usb_dac_mixer import discover_usb_dac_mixer
+            cached = discover_usb_dac_mixer()
+            self._usb_mixer_cache = cached
+            self._usb_mixer_cache_ts = now
+        return cached
+
+    def _format_usb_hw_vol(self) -> str:
+        usb_mix = self._get_usb_dac_mixer_state(force_refresh=False)
+        if usb_mix.get("status") == "ok":
+            db_s = usb_mix.get("db_str", "")
+            return f"{usb_mix['pct']}% ({db_s})" if db_s else f"{usb_mix['cur_val']}/{usb_mix['max_val']}"
+        if usb_mix.get("status") == "unsupported":
+            return "Unsupported"
+        return "No USB DAC"
+
+    def _refresh_usb_dac_hw_volume(self):
+        """Re-probes any connected USB DAC's ALSA hardware mixer on C click."""
+        st = self._get_usb_dac_mixer_state(force_refresh=True)
+        if st.get("status") == "ok":
+            self.show_info_toast(f"{st['card_name']}: {st['control']} ({st['min_val']}-{st['max_val']})", duration=1.8)
+        elif st.get("status") == "unsupported":
+            self.show_info_toast(f"{st['card_name']}: No HW Vol", duration=1.8)
+        else:
+            self.show_info_toast("No USB DAC", duration=1.5)
+        self._rebuild_menu()
+        self.ui.request_render()
+
+    def _tune_usb_dac_hw_volume(self, delta: int):
+        """Steps any connected USB DAC's ALSA hardware pvolume control independently of PipeWire software volume."""
+        import asyncio
+        st = self._get_usb_dac_mixer_state(force_refresh=False)
+        if st.get("status") != "ok":
+            self._refresh_usb_dac_hw_volume()
+            return
+        lo = int(st["min_val"])
+        hi = int(st["max_val"])
+        new_val = max(lo, min(hi, int(st["cur_val"]) + int(delta)))
+        if new_val == int(st["cur_val"]):
+            return
+        st["cur_val"] = new_val
+        st["pct"] = round(((new_val - lo) / max(1, hi - lo)) * 100)
+        self._usb_mixer_pending = (int(st["card"]), str(st["control"]), new_val)
+        task = getattr(self, "_usb_mixer_sync_task", None)
+        if task and not task.done():
+            task.cancel()
+        self._usb_mixer_sync_task = asyncio.create_task(self._debounced_usb_dac_vol_sync())
+        self._rebuild_menu()
+        self.ui.request_render()
+
+    def _tune_software_volume(self, delta: int):
+        """Steps OS PipeWire software volume (Standard or Exclusive) via UIManager.adjust_pi_volume."""
+        import asyncio
+        async def _run():
+            await self.ui.adjust_pi_volume(delta)
+            self._rebuild_menu()
+            self.ui.request_render()
+        asyncio.create_task(_run())
+
+    async def _debounced_usb_dac_vol_sync(self):
+        import asyncio
+        from src.hardware.usb_dac_mixer import set_usb_dac_volume
+        try:
+            await asyncio.sleep(0.06)
+            pending = getattr(self, "_usb_mixer_pending", None)
+            if not pending:
+                return
+            card, control, raw_val = pending
+            res = await asyncio.to_thread(set_usb_dac_volume, card, control, raw_val)
+            if res and getattr(self, "_usb_mixer_cache", None):
+                self._usb_mixer_cache.update(res)
+                self._rebuild_menu()
+                self.ui.request_render()
+        except asyncio.CancelledError:
+            pass
+
     def _tune_i2s_balance(self, delta: int):
         """Callback attached to 'on_tune' for 0.5dB hardware L/R balance trim (-20 = L+10.0dB to +20 = R+10.0dB)."""
         current_bal = int(self.db.get_setting("i2s_dac_balance_steps", "0"))
@@ -1404,7 +1486,14 @@ class AudioSettingsApp(ListMenuApp):
                 "3": "Max-Boost (0x777)"
             }
             phy_str = phy_map.get(phy_boost, "Gentle (0x322) ★")
+            usb_hw_vol_str = self._format_usb_hw_vol()
             items = [
+                {
+                    "name": "HW Volume",
+                    "suffix": usb_hw_vol_str,
+                    "on_tune": self._tune_usb_dac_hw_volume,
+                    "action": self._refresh_usb_dac_hw_volume
+                },
                 {
                     "name": "USB Audio In",
                     "suffix": usb_am_lbl,
@@ -1622,6 +1711,70 @@ class AudioSettingsApp(ListMenuApp):
                     "action": self._prompt_restore_defaults
                 }
             ]
+        elif self.current_menu == "volume":
+            self.title = "Volume"
+            sw_vol_str = getattr(self.ui, "pi_volume_str", None)
+            if not sw_vol_str:
+                _sw_key = "exclusive_volume" if raw_excl in ("1", "2") else "standard_volume"
+                sw_vol_str = f"{float(self.db.get_setting(_sw_key, '1.0')) * 100:.0f}%"
+            usb_hw_vol_str = self._format_usb_hw_vol()
+            transp_pct = int(self.db.get_setting("transparency_vol_pct", "100"))
+            transp_vol_str = f"{transp_pct}% ★" if transp_pct == 100 else f"{transp_pct}%"
+            feed_pct = int(self.db.get_setting("mic_feed_vol_pct", "100"))
+            feed_vol_str = f"{feed_pct}% ★" if feed_pct == 100 else f"{feed_pct}%"
+            items = [
+                {
+                    "name": "Software Vol",
+                    "suffix": sw_vol_str,
+                    "on_tune": self._tune_software_volume
+                },
+                {
+                    "name": "Volume Mode",
+                    "suffix": excl_mode,
+                    "action": self._toggle_exclusive_mode
+                },
+                {
+                    "name": "USB HW Vol",
+                    "suffix": usb_hw_vol_str,
+                    "on_tune": self._tune_usb_dac_hw_volume,
+                    "action": self._refresh_usb_dac_hw_volume
+                },
+                {
+                    "name": "I2S HW Vol",
+                    "suffix": dig_vol_str,
+                    "on_tune": self._tune_i2s_digital_volume
+                },
+                {
+                    "name": "I2S Analog",
+                    "suffix": gain_str,
+                    "action": self._toggle_i2s_gain
+                },
+                {
+                    "name": "I2S Balance",
+                    "suffix": bal_str,
+                    "on_tune": self._tune_i2s_balance
+                },
+                {
+                    "name": "I2S Ramp",
+                    "suffix": ramp_str,
+                    "action": self._cycle_i2s_vol_ramp
+                },
+                {
+                    "name": "Mic Gain",
+                    "suffix": mic_gain_str,
+                    "on_tune": self._tune_mic_gain
+                },
+                {
+                    "name": "Transp. Vol",
+                    "suffix": transp_vol_str,
+                    "on_tune": self._tune_transparency_vol
+                },
+                {
+                    "name": "Music Feed Vol",
+                    "suffix": feed_vol_str,
+                    "on_tune": self._tune_mic_feed_vol
+                }
+            ]
         else:
             self.title = "Audio Settings"
             items = [
@@ -1629,6 +1782,11 @@ class AudioSettingsApp(ListMenuApp):
                     "name": "Output",
                     "suffix": dac_out_str,
                     "action": self._toggle_audio_output
+                },
+                {
+                    "name": "Volume",
+                    "suffix": ">",
+                    "action": lambda: self._open_submenu("volume")
                 },
                 {
                     "name": "I2S DAC",
