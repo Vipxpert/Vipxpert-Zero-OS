@@ -79,6 +79,21 @@ class SettingsApp(ListMenuApp):
         self.is_tuning = False
         self.ui.request_render()
 
+    def _open_tone_calibrator(self):
+        """Launches the live Gradient Mapping (T0/T1/T2 + Grad/Snap) tuner with PWM & 16-scale dither preview."""
+        self._tcal_orig_t0 = int(self.db.get_setting("oled_pwm_t0", str(getattr(self.display, "pwm_t0", 48))))
+        self._tcal_orig_t1 = int(self.db.get_setting("oled_pwm_t1", str(getattr(self.display, "pwm_t1", 128))))
+        self._tcal_orig_t2 = int(self.db.get_setting("oled_pwm_t2", str(getattr(self.display, "pwm_t2", 208))))
+        self._tcal_orig_ramp = self.db.get_setting("oled_dither_ramp", "1" if getattr(self.display, "dither_ramp", True) else "0") != "0"
+        self._tcal_t0 = max(1, min(250, self._tcal_orig_t0))
+        self._tcal_t1 = max(self._tcal_t0 + 1, min(252, self._tcal_orig_t1))
+        self._tcal_t2 = max(self._tcal_t1 + 1, min(254, self._tcal_orig_t2))
+        self._tcal_ramp = self._tcal_orig_ramp
+        self._tcal_sel = 0  # 0=T0, 1=T1, 2=T2
+        self.current_menu = "tone_cal"
+        self.is_tuning = False
+        self.ui.request_render()
+
     def _open_disp_calibrator(self):
         """Launches live Brightness / Pixel Drive / Contrast demo & tuning screen."""
         self._dcal_orig_brt = int(self.db.get_setting("brightness", "128"))
@@ -163,7 +178,7 @@ class SettingsApp(ListMenuApp):
                 self.db.set_setting("brightness", str(self._dcal_brt))
                 self.db.set_setting("oled_drive_mode", self._dcal_drv)
                 self.db.set_setting("invert_display", "1" if self._dcal_inv else "0")
-                self.current_menu = "display_ui"
+                self.current_menu = "panel_cfg"
                 self._rebuild_menu(preserve_cursor=True)
                 self.show_info_toast(f"Saved {round((self._dcal_brt/255)*100)}% {self._dcal_drv}")
                 self.ui.request_render()
@@ -173,7 +188,7 @@ class SettingsApp(ListMenuApp):
                     self.display.apply_oled_drive_profile("max", getattr(self, "_dcal_orig_drv", "normal"))
                 if hasattr(self.display, "set_invert"):
                     self.display.set_invert(getattr(self, "_dcal_orig_inv", False))
-                self.current_menu = "display_ui"
+                self.current_menu = "panel_cfg"
                 self._rebuild_menu(preserve_cursor=True)
                 self.show_info_toast("Display Canceled")
                 self.ui.request_render()
@@ -251,12 +266,60 @@ class SettingsApp(ListMenuApp):
                 self.show_info_toast("Calib Canceled")
                 self.ui.request_render()
             return
+        if self.current_menu == "tone_cal":
+            if action == "CLICK" and char in ("2", "8"):
+                delta = -1 if char == "2" else 1
+                self._tcal_sel = (getattr(self, "_tcal_sel", 0) + delta) % 3
+                self.ui.request_render()
+            elif action in ("CLICK", "HOLD") and char in ("4", "6"):
+                step = -4 if char == "4" else 4
+                sel = getattr(self, "_tcal_sel", 0)
+                if sel == 0:
+                    self._tcal_t0 = max(1, min(self._tcal_t1 - 4, self._tcal_t0 + step))
+                elif sel == 1:
+                    self._tcal_t1 = max(self._tcal_t0 + 4, min(self._tcal_t2 - 4, self._tcal_t1 + step))
+                else:
+                    self._tcal_t2 = max(self._tcal_t1 + 4, min(254, self._tcal_t2 + step))
+                self.display.set_gray_engine_config(pwm_t0=self._tcal_t0, pwm_t1=self._tcal_t1, pwm_t2=self._tcal_t2)
+                self.ui.request_render()
+            elif action == "CLICK" and char == "0":
+                self._tcal_t0, self._tcal_t1, self._tcal_t2 = 48, 128, 208
+                self.display.set_gray_engine_config(pwm_t0=48, pwm_t1=128, pwm_t2=208)
+                self.ui.request_render()
+            elif action == "CLICK" and char == "#":
+                self._tcal_ramp = not getattr(self, "_tcal_ramp", True)
+                self.display.set_gray_engine_config(dither_ramp=self._tcal_ramp)
+                self.ui.request_render()
+            elif action == "CLICK" and char == "C":
+                self.db.set_setting("oled_pwm_t0", str(self._tcal_t0))
+                self.db.set_setting("oled_pwm_t1", str(self._tcal_t1))
+                self.db.set_setting("oled_pwm_t2", str(self._tcal_t2))
+                self.db.set_setting("oled_dither_ramp", "1" if getattr(self, "_tcal_ramp", True) else "0")
+                self.display.set_gray_engine_config(pwm_t0=self._tcal_t0, pwm_t1=self._tcal_t1, pwm_t2=self._tcal_t2, dither_ramp=getattr(self, "_tcal_ramp", True))
+                self.current_menu = "gray_cfg"
+                self._rebuild_menu(preserve_cursor=True)
+                self.show_info_toast(f"Saved {'Grad' if getattr(self, '_tcal_ramp', True) else 'Snap'} {self._tcal_t0}/{self._tcal_t1}/{self._tcal_t2}")
+                self.ui.request_render()
+            elif action == "CLICK" and char == "D":
+                self.display.set_gray_engine_config(
+                    pwm_t0=getattr(self, "_tcal_orig_t0", 48),
+                    pwm_t1=getattr(self, "_tcal_orig_t1", 128),
+                    pwm_t2=getattr(self, "_tcal_orig_t2", 208),
+                    dither_ramp=getattr(self, "_tcal_orig_ramp", True),
+                )
+                self.current_menu = "gray_cfg"
+                self._rebuild_menu(preserve_cursor=True)
+                self.show_info_toast("Gradient Canceled")
+                self.ui.request_render()
+            return
         if not getattr(self, 'is_tuning', False) and self.current_menu != "root":
             if char == 'D' and action == 'CLICK':
                 # Stage: Hierarchical Back Navigation Map (Maps every nested Lock & Scenes view to its parent menu)
                 prev_m = self.current_menu
                 parent_map = {
                     "gray_cfg":       "display_ui",
+                    "ui_ux_cfg":      "display_ui",
+                    "panel_cfg":      "display_ui",
                     "lock_slots":     "lock_cfg",
                     "lock_slot_item": "lock_slots",
                     "lock_cat":        "lock_slots",
@@ -446,6 +509,30 @@ class SettingsApp(ListMenuApp):
             self.display.draw_shaded_rect(64, 51, 95, 62, shade=0.67, mode_override="pwm")
             self.display.draw.rectangle((96, 51, 127, 62), fill=1)
             return
+        if self.current_menu == "tone_cal":
+            from PIL import Image
+            t0 = getattr(self, "_tcal_t0", 48)
+            t1 = getattr(self, "_tcal_t1", 128)
+            t2 = getattr(self, "_tcal_t2", 208)
+            ramp = getattr(self, "_tcal_ramp", True)
+            sel = getattr(self, "_tcal_sel", 0)
+            s0 = f">{t0}<" if sel == 0 else str(t0)
+            s1 = f">{t1}<" if sel == 1 else str(t1)
+            s2 = f">{t2}<" if sel == 2 else str(t2)
+            self.display.draw_text(2, 0, f"T0:{s0} T1:{s1}", font_type="small")
+            self.display.draw_text(2, 12, f"T2:{s2} {'Grad' if ramp else 'Snap'} #:M", font_type="small")
+            self.display.draw_text(2, 24, "2/8:Sel 4/6:+- 0:Def C/D", font_type="small")
+            for tx in (t0, t1, t2):
+                px = max(0, min(127, int(tx * 127 / 255)))
+                self.display.draw.line((px, 36, px, 38), fill=1)
+            # Comment (order): Paste the 16-scale dither bar onto self.image BEFORE draw_gray_frame() so ph1/lo snapshot it at full 3/3 (100% white) duty instead of 1/3 (33% dark gray).
+            scale_row = bytes(int((x // 8) * 255 / 15) for x in range(128))
+            if hasattr(self.display, "_apply_dither_img"):
+                d_img = self.display._apply_dither_img(Image.frombytes("L", (128, 11), scale_row * 11), ramp=ramp)
+                self.display.image.paste(d_img, (0, 51))
+            grad_row = bytes(int(x * 255 / 127) for x in range(128))
+            self.display.draw_gray_frame(0, 39, 128, 11, grad_row * 11)
+            return
         if self.current_menu == "disp_cal":
             sel = getattr(self, "_dcal_sel", 0)
             pct = round((getattr(self, "_dcal_brt", 128) / 255) * 100)
@@ -484,17 +571,6 @@ class SettingsApp(ListMenuApp):
             self.display.has_active_marquee = True
             return
         super()._draw_state()
-        if getattr(self, "_show_3d_cube", False) and self.current_menu == "display_ui":
-            if hasattr(self.display, "render_wireframe_3d"):
-                verts = [(-1,-1,-1),(1,-1,-1),(1,1,-1),(-1,1,-1),(-1,-1,1),(1,-1,1),(1,1,1),(-1,1,1)]
-                edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
-                seq = getattr(self.display, "_frame_seq", 0)
-                ang = seq * 0.07
-                self.display.draw.rectangle((78, 14, 123, 50), fill="black", outline="white")
-                if getattr(self.display, "dither_mode", "off") != "off" and hasattr(self.display, "draw_shaded_rect"):
-                    for i, sh in enumerate((0.2, 0.4, 0.6, 0.8, 1.0)):
-                        self.display.draw_shaded_rect(79 + i * 9, 15, 79 + (i + 1) * 9 - 1, 19, sh)
-                self.display.render_wireframe_3d(verts, edges, ang * 0.6, ang, cx=100, cy=35, scale=16.5, dist=3.2)
 
     def _cycle_timeout(self, key_name: str):
         """Cycles through standard timeout options: 15s, 30s, 60s, 120s, 0 (Never)."""
@@ -1121,8 +1197,41 @@ class SettingsApp(ListMenuApp):
 
         if self.current_menu == "display_ui":
             self.title = "Display & UI"
+            min_on = self.db.get_setting("ui_minimal_mode", "0") == "1"
+            min_lbl = "On (Min)" if min_on else "Off (Mod) ★"
+            items = [
+                {
+                    "name": "Minimal Mode",
+                    "suffix": min_lbl,
+                    "action": lambda: self._cycle_db_opts("ui_minimal_mode", ["0", "1"], "0", 1),
+                    "on_tune": lambda d: self._cycle_db_opts("ui_minimal_mode", ["0", "1"], "0", d)
+                },
+                {
+                    "name": "Animations & UX",
+                    "end_indicator": ">",
+                    "action": lambda: self._open_submenu("ui_ux_cfg")
+                },
+                {
+                    "name": "Panel & Drive",
+                    "end_indicator": ">",
+                    "action": lambda: self._open_submenu("panel_cfg")
+                },
+                {
+                    "name": "Gray & PWM",
+                    "end_indicator": ">",
+                    "action": lambda: self._open_submenu("gray_cfg")
+                },
+            ]
+        elif self.current_menu == "ui_ux_cfg":
+            self.title = "Animations & UX"
             ln_style = self.db.get_setting("ui_launcher_style", "modern")
             ln_lbl = "Minimal List" if ln_style == "minimal" else "Modern Dock ★"
+            rc_style = self.db.get_setting("ui_recent_style", "modern")
+            rc_lbl = "Classic List" if rc_style == "minimal" else "Live Cards ★"
+            tr_fx = self.db.get_setting("ui_transition_fx", "iris")
+            tr_lbl = {"iris": "Portal ★", "bayer": "Bayer", "curtain": "Curtain", "off": "Off"}.get(tr_fx, "Portal ★")
+            scn_scr = self.db.get_setting("ui_scene_scroll", "1") != "0"
+            scn_lbl = "Slide ★" if scn_scr else "Instant"
             sm_scr = self.db.get_setting("ui_smooth_scroll", "1") != "0"
             sm_lbl = "Smooth ★" if sm_scr else "Instant"
             items = [
@@ -1133,25 +1242,42 @@ class SettingsApp(ListMenuApp):
                     "on_tune": lambda d: self._cycle_db_opts("ui_launcher_style", ["modern", "minimal"], "modern", d)
                 },
                 {
+                    "name": "Recent Style",
+                    "suffix": rc_lbl,
+                    "action": lambda: self._cycle_db_opts("ui_recent_style", ["modern", "minimal"], "modern", 1),
+                    "on_tune": lambda d: self._cycle_db_opts("ui_recent_style", ["modern", "minimal"], "modern", d)
+                },
+                {
+                    "name": "Screen Trans",
+                    "suffix": tr_lbl,
+                    "action": lambda: self._cycle_db_opts("ui_transition_fx", ["iris", "bayer", "curtain", "off"], "iris", 1),
+                    "on_tune": lambda d: self._cycle_db_opts("ui_transition_fx", ["iris", "bayer", "curtain", "off"], "iris", d)
+                },
+                {
+                    "name": "Scene Scroll",
+                    "suffix": scn_lbl,
+                    "action": lambda: self._cycle_db_opts("ui_scene_scroll", ["1", "0"], "1", 1),
+                    "on_tune": lambda d: self._cycle_db_opts("ui_scene_scroll", ["1", "0"], "1", d)
+                },
+                {
                     "name": "Menu Scroll",
                     "suffix": sm_lbl,
                     "action": lambda: self._cycle_db_opts("ui_smooth_scroll", ["1", "0"], "1", 1),
                     "on_tune": lambda d: self._cycle_db_opts("ui_smooth_scroll", ["1", "0"], "1", d)
                 },
                 {
+                    "name": "Scroll Speed",
+                    "suffix": spd_str,
+                    "on_tune": self._tune_marquee_speed
+                }
+            ]
+        elif self.current_menu == "panel_cfg":
+            self.title = "Panel & Drive"
+            items = [
+                {
                     "name": "Brightness & Drive",
                     "end_indicator": ">",
                     "action": self._open_disp_calibrator
-                },
-                {
-                    "name": "Gray & PWM",
-                    "end_indicator": ">",
-                    "action": lambda: self._open_submenu("gray_cfg")
-                },
-                {
-                    "name": "Clock Format",
-                    "suffix": clk_str,
-                    "action": self._toggle_clock_format
                 },
                 {
                     "name": "OLED Refresh",
@@ -1159,10 +1285,10 @@ class SettingsApp(ListMenuApp):
                     "on_tune": self._tune_oled_fps
                 },
                 {
-                    "name": "Scroll Speed",
-                    "suffix": spd_str,
-                    "on_tune": self._tune_marquee_speed
-                }
+                    "name": "Clock Format",
+                    "suffix": clk_str,
+                    "action": self._toggle_clock_format
+                },
             ]
         elif self.current_menu == "gray_cfg":
             self.title = "Gray & PWM"
@@ -1172,9 +1298,13 @@ class SettingsApp(ListMenuApp):
             lo_v = int(self.db.get_setting("oled_dither_lo", str(getattr(self.display, "dither_lo", 42))))
             hi_v = int(self.db.get_setting("oled_dither_hi", str(getattr(self.display, "dither_hi", 70))))
             pwm_ms = float(self.db.get_setting("oled_pwm_dt", str(getattr(self.display, "_pwm_base_dt", 0.006451948)))) * 1e3
+            t0 = int(self.db.get_setting("oled_pwm_t0", str(getattr(self.display, "pwm_t0", 48))))
+            t1 = int(self.db.get_setting("oled_pwm_t1", str(getattr(self.display, "pwm_t1", 128))))
+            t2 = int(self.db.get_setting("oled_pwm_t2", str(getattr(self.display, "pwm_t2", 208))))
             items = [
                 {"name": "Gray Mode", "suffix": gm_lbl, "end_indicator": ">", "action": self._open_gray_mode_calibrator},
                 {"name": "Dither & Calib", "suffix": alg, "end_indicator": ">", "action": self._open_gray_calibrator},
+                {"name": "Gradient Mapping", "suffix": f"{t0}/{t1}/{t2}", "end_indicator": ">", "action": self._open_tone_calibrator},
                 {"name": "PWM Sync Cal", "suffix": f"{pwm_ms:.2f}ms", "end_indicator": ">", "action": self._open_pwm_calibrator},
             ]
         elif self.current_menu == "hw_diag":
@@ -1409,20 +1539,20 @@ class SettingsApp(ListMenuApp):
                 items.append({"name": "Auto-Rotate", "suffix": "On ★" if a_val == "1" else "Manual", "action": lambda: self._cycle_db_opts("scn_3d_auto", ["1", "0"], "1", 1), "on_tune": lambda d: self._cycle_db_opts("scn_3d_auto", ["1", "0"], "1", d)})
                 items.append({"name": "Default Zoom", "suffix": f"{s_val}x ★" if s_val == "20" else f"{s_val}x", "action": lambda: self._cycle_db_opts("scn_3d_scale", ["16", "20", "24", "28"], "20", 1), "on_tune": lambda d: self._cycle_db_opts("scn_3d_scale", ["16", "20", "24", "28"], "20", d)})
             elif sc_id == "ambient_pond":
-                pd_val = self.db.get_setting("scn_pond_drops", "4")
-                pd_lbl = {"2": "Light (2)", "4": "Normal (4) ★", "7": "Heavy (7)"}.get(pd_val, "Normal (4) ★")
-                ps_val = self.db.get_setting("scn_pond_spd", "1.15")
-                ps_lbl = {"0.8": "Calm 0.8x", "1.15": "Normal ★", "1.6": "Fast 1.6x"}.get(ps_val, "Normal ★")
-                items.append({"name": "Rain Density", "suffix": pd_lbl, "action": lambda: self._cycle_db_opts("scn_pond_drops", ["2", "4", "7"], "4", 1), "on_tune": lambda d: self._cycle_db_opts("scn_pond_drops", ["2", "4", "7"], "4", d)})
-                items.append({"name": "Ripple Speed", "suffix": ps_lbl, "action": lambda: self._cycle_db_opts("scn_pond_spd", ["0.8", "1.15", "1.6"], "1.15", 1), "on_tune": lambda d: self._cycle_db_opts("scn_pond_spd", ["0.8", "1.15", "1.6"], "1.15", d)})
+                pd_val = self.db.get_setting("scn_pond_drops", "5")
+                pd_lbl = {"2": "Light (2)", "5": "Normal (5) ★", "8": "Heavy (8)"}.get(pd_val, f"{pd_val} Drops")
+                ps_val = self.db.get_setting("scn_pond_spd", "1.85")
+                ps_lbl = {"1.15": "Calm 1.15x", "1.85": "Lively ★", "2.5": "Rapid 2.5x"}.get(ps_val, f"{ps_val}x")
+                items.append({"name": "Rain Density", "suffix": pd_lbl, "action": lambda: self._cycle_db_opts("scn_pond_drops", ["2", "5", "8"], "5", 1), "on_tune": lambda d: self._cycle_db_opts("scn_pond_drops", ["2", "5", "8"], "5", d)})
+                items.append({"name": "Ripple Speed", "suffix": ps_lbl, "action": lambda: self._cycle_db_opts("scn_pond_spd", ["1.15", "1.85", "2.5"], "1.85", 1), "on_tune": lambda d: self._cycle_db_opts("scn_pond_spd", ["1.15", "1.85", "2.5"], "1.85", d)})
             elif sc_id == "ambient_stars":
-                sp_val = self.db.get_setting("scn_star_spd", "1.5")
-                items.append({"name": "Warp Speed", "suffix": f"{sp_val}x ★" if sp_val == "1.5" else f"{sp_val}x", "action": lambda: self._cycle_db_opts("scn_star_spd", ["0.8", "1.5", "2.5", "3.8"], "1.5", 1), "on_tune": lambda d: self._cycle_db_opts("scn_star_spd", ["0.8", "1.5", "2.5", "3.8"], "1.5", d)})
+                sp_val = self.db.get_setting("scn_star_spd", "0.85")
+                items.append({"name": "Warp Speed", "suffix": f"{sp_val}x ★" if sp_val == "0.85" else f"{sp_val}x", "action": lambda: self._cycle_db_opts("scn_star_spd", ["0.5", "0.85", "1.5", "2.5"], "0.85", 1), "on_tune": lambda d: self._cycle_db_opts("scn_star_spd", ["0.5", "0.85", "1.5", "2.5"], "0.85", d)})
             elif sc_id == "ambient_grass":
-                w_val = self.db.get_setting("scn_grass_wind", "0.8")
-                h_val = self.db.get_setting("scn_grass_ht", "22")
-                items.append({"name": "Breeze Strength", "suffix": f"{w_val}x ★" if w_val == "0.8" else f"{w_val}x", "action": lambda: self._cycle_db_opts("scn_grass_wind", ["0.3", "0.8", "1.5", "2.2"], "0.8", 1), "on_tune": lambda d: self._cycle_db_opts("scn_grass_wind", ["0.3", "0.8", "1.5", "2.2"], "0.8", d)})
-                items.append({"name": "Blade Height", "suffix": f"{h_val}px ★" if h_val == "22" else f"{h_val}px", "action": lambda: self._cycle_db_opts("scn_grass_ht", ["16", "22", "28", "34"], "22", 1), "on_tune": lambda d: self._cycle_db_opts("scn_grass_ht", ["16", "22", "28", "34"], "22", d)})
+                w_val = self.db.get_setting("scn_grass_wind", "1.35")
+                h_val = self.db.get_setting("scn_grass_ht", "14")
+                items.append({"name": "Breeze Strength", "suffix": f"{w_val}x ★" if w_val == "1.35" else f"{w_val}x", "action": lambda: self._cycle_db_opts("scn_grass_wind", ["0.6", "1.35", "2.0", "2.8"], "1.35", 1), "on_tune": lambda d: self._cycle_db_opts("scn_grass_wind", ["0.6", "1.35", "2.0", "2.8"], "1.35", d)})
+                items.append({"name": "Blade Height", "suffix": f"{h_val}px ★" if h_val == "14" else f"{h_val}px", "action": lambda: self._cycle_db_opts("scn_grass_ht", ["10", "14", "20", "26"], "14", 1), "on_tune": lambda d: self._cycle_db_opts("scn_grass_ht", ["10", "14", "20", "26"], "14", d)})
             elif sc_id == "ambient_bounce":
                 b_val = self.db.get_setting("scn_bnc_shape", "0")
                 b_lbl = {"0": "VIP Badge ★", "1": "Diamond", "2": "Orb"}.get(b_val, "VIP Badge ★")
