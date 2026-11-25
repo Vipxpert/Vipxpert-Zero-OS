@@ -25,11 +25,13 @@ from src.core.media_arbiter import MediaArbiter
 class OSKernel:
     def __init__(self):
         self.db = DatabaseManager()
+        self.hw_profile = self._run_boot_hw_profile()
         self.recover_i2c0_bus(force=False)
         self.display = Display()
         self.keypad = Keypad()
         self.ir_hardware = IRTransceiver()
         self.ui_manager = UIManager(self.display, self.db)
+        self.ui_manager.hw_profile = self.hw_profile
         self.ui_manager.os_kernel = self  # INJECT: Expose kernel to UI for hardware callbacks
         self.keypad.ui_manager = self.ui_manager  # INJECT: Allow keypad to throttle polling during OLED sleep
         self.bt_daemon = BluetoothDaemon(self.ui_manager, self.db)
@@ -62,15 +64,8 @@ class OSKernel:
             'lock_screen': lambda: LockScreenApp(self.display, self.ui_manager),
             'recent_tab': lambda: RecentApp(self.display, self.ui_manager),
             'ir_remote': lambda: IRControllerApp(self.display, self.ui_manager, self.db, self.ir_hardware),
-            'app_selector': lambda: ListMenuApp(
-                self.display, self.ui_manager, 
-                title="Apps", 
-                items=[
-                    {"name": "Offline Music", "action": "music_app"},
-                    {"name": "IR Remote", "action": "ir_remote"}, 
-                    {"name": "Settings", "action": "settings"}
-                ]
-            ),
+            'app_selector': lambda: __import__('src.apps.launcher_app', fromlist=['']).AppLauncherApp(self.display, self.ui_manager, self.db),
+            'cartridges': lambda: __import__('src.apps.cartridge_app', fromlist=['']).CartridgeLauncherApp(self.display, self.ui_manager, self.db),
             'music_app': lambda: __import__('src.apps.music_app', fromlist=['']).OfflineMusicApp(self.display, self.ui_manager, self.db),
             'settings': lambda: SettingsApp(self.display, self.ui_manager, self.db),
             'audio_settings': lambda: AudioSettingsApp(self.display, self.ui_manager, self.db),
@@ -85,6 +80,52 @@ class OSKernel:
         
         self.is_running = False
         self.tasks = []
+
+    # Stage: Rust Boot Hardware Auto-Profiler (Adapts weak single/dual-core boards to Minimal/Balanced defaults without overwriting user settings)
+    def _run_boot_hw_profile(self) -> dict:
+        import json, os
+        cores = os.cpu_count() or 1
+        prof = {
+            "tier": "full" if cores >= 4 else ("balanced" if cores >= 2 else "minimal"),
+            "cores": cores,
+            "mem_mb": 512,
+            "dsp_us": 0,
+            "pack_us": 0,
+            "rec_fps": 60 if cores >= 4 else (30 if cores >= 2 else 20),
+            "rec_pwm": "max" if cores >= 4 else ("normal" if cores >= 2 else "off"),
+            "rec_dither": "pwm" if cores >= 4 else ("spatial" if cores >= 2 else "off"),
+            "rec_bands": 20 if cores >= 4 else (16 if cores >= 2 else 10),
+            "rec_caps": "pwm" if cores >= 4 else ("solid" if cores >= 2 else "off"),
+            "dsp_cores": "0,2" if cores >= 4 else "0",
+            "bg_cores": "0",
+        }
+        bench_bin = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "bin", "hw_bench"))
+        if os.path.isfile(bench_bin) and os.access(bench_bin, os.X_OK):
+            try:
+                res = subprocess.run([bench_bin], capture_output=True, text=True, timeout=0.5)
+                if res.returncode == 0 and res.stdout.strip():
+                    prof.update(json.loads(res.stdout.strip()))
+            except Exception as e:
+                print(f"[OSKernel] hw_bench fallback ({e})", flush=True)
+        # Comment (invariant): Seed hardware-appropriate defaults strictly when keys are absent from SQLite; never overwrite explicit user settings or calibrated oled_pwm_dt.
+        sentinel = "__UNSET__"
+        defaults_if_unset = (
+            ("oled_fps", str(prof["rec_fps"])),
+            ("oled_pwm_mode", str(prof["rec_pwm"])),
+            ("oled_dither_mode", str(prof["rec_dither"])),
+            ("lock_viz_bands", str(prof["rec_bands"])),
+            ("lock_viz_cap_style", str(prof["rec_caps"])),
+        )
+        for k, v in defaults_if_unset:
+            if self.db.get_setting(k, sentinel) == sentinel:
+                self.db.set_setting(k, v)
+        self.db.set_setting("hw_perf_tier", str(prof["tier"]))
+        print(
+            f"[OSKernel] Hardware Profile: tier={prof['tier']} cores={prof['cores']} mem={prof['mem_mb']}MB "
+            f"dsp={prof['dsp_us']}us pack={prof['pack_us']}us dsp_cores={prof['dsp_cores']}",
+            flush=True,
+        )
+        return prof
 
     def _handle_udev_event(self):
         """Fires instantly on zero-cost hardware interrupts."""
@@ -108,6 +149,15 @@ class OSKernel:
                 if hasattr(self, 'sound_manager') and self.sound_manager:
                     self.sound_manager.play("usb_connect")
                 asyncio.create_task(self._enforce_audio_routing())
+                async def _reapply_wp():
+                    await asyncio.sleep(0.8)
+                    try:
+                        from src.hardware.walkplay_hid import reapply_walkplay_profile
+                        if reapply_walkplay_profile(self.db):
+                            print(f"[Kernel] Re-applied saved Walkplay Filter & PEQ for {name} (Gain untouched)", flush=True)
+                    except Exception as e:
+                        print(f"[Kernel] Walkplay reapply error: {e}", flush=True)
+                asyncio.create_task(_reapply_wp())
                 
                 # Execute Auto-Connect trigger on USB DAC plug (Mode 2: On Plug)
                 mode = int(self.db.get_setting('bt_autoconnect', '0'))
@@ -1020,9 +1070,10 @@ class OSKernel:
                             continue
                         try:
                             if _pid_s == _my_pid_s:
+                                _ui_aff = {0, 2} if (_os.cpu_count() or 1) >= 4 else {0}
                                 for _tid_s in _os.listdir(f"/proc/{_pid_s}/task"):
-                                    if _tid_s.isdigit() and _os.sched_getaffinity(int(_tid_s)) != {0, 2}:
-                                        _os.sched_setaffinity(int(_tid_s), {0, 2})
+                                    if _tid_s.isdigit() and _os.sched_getaffinity(int(_tid_s)) != _ui_aff:
+                                        _os.sched_setaffinity(int(_tid_s), _ui_aff)
                                 continue
                             with open(f"/proc/{_pid_s}/cmdline", "rb") as _cf:
                                 _cmd = _cf.read().decode("utf-8", errors="ignore")
@@ -1120,6 +1171,12 @@ class OSKernel:
                 name = device.get('ID_MODEL').replace('_', ' ')
                 self.ui_manager.active_hardware_dac = name
                 print(f"[Kernel] Boot-time USB DAC Found: {name}")
+                try:
+                    from src.hardware.walkplay_hid import reapply_walkplay_profile
+                    if reapply_walkplay_profile(self.db):
+                        print(f"[Kernel] Boot-time Walkplay Filter & PEQ restored for {name} (Gain untouched)", flush=True)
+                except Exception as e:
+                    print(f"[Kernel] Boot-time Walkplay reapply error: {e}", flush=True)
                 break
 
     def _debounce_bt_restart(self):

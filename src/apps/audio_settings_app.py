@@ -33,14 +33,230 @@ class AudioSettingsApp(ListMenuApp):
         self.ui.request_render()
 
     async def handle_key(self, action: str, char: str):
-        """Intercepts Back (Key 'D' CLICK) inside sub-menus to return to root Audio Settings before exiting."""
+        """Intercepts Back (Key 'D' CLICK) inside sub-menus to return to parent Audio Settings menu before exiting."""
         if not getattr(self, 'is_tuning', False) and self.current_menu != "root":
             if char == 'D' and action == 'CLICK':
-                self.current_menu = "root"
+                if self.current_menu == "walkplay_band":
+                    self.current_menu = "walkplay_peq"
+                elif self.current_menu == "walkplay_peq":
+                    self.current_menu = "walkplay_dsp"
+                elif self.current_menu == "walkplay_dsp":
+                    self.current_menu = "usb_dac"
+                else:
+                    self.current_menu = "root"
                 self._rebuild_menu(preserve_cursor=False)
                 self.ui.request_render()
                 return
         await super().handle_key(action, char)
+
+    # Stage: Offline Walkplay / KTMicro USB DAC HID Control (BGVP MX1 & compatible 0x4B dongles)
+    def _refresh_walkplay_state(self, toast: bool = False):
+        from src.hardware.walkplay_hid import discover_walkplay_device, WalkplayHID
+        dev = discover_walkplay_device()
+        self._wp_dev = dev
+        if not dev:
+            self._wp_fw = ""
+            self._wp_peq_en = False
+            self._wp_bands = []
+            if toast:
+                self.show_info_toast("No Walkplay DAC")
+            return
+        try:
+            with WalkplayHID(dev["path"]) as wp:
+                self._wp_fw = wp.read_firmware()
+                self._wp_peq_en = wp.read_peq_enable()
+                self._wp_filter = wp.read_dac_filter()
+                self._wp_gain_high = wp.read_gain_high()
+                self._wp_preamp = wp.read_preamp()
+                self._wp_bands = [b for i in range(8) if (b := wp.read_band(i)) is not None]
+            if toast:
+                self.show_info_toast(f"{dev['name'][:12]} v{self._wp_fw}")
+        except Exception:
+            self._wp_bands = []
+            if toast:
+                self.show_info_toast("HID Read Error")
+
+    def _open_walkplay_dsp(self):
+        self._refresh_walkplay_state(toast=False)
+        if not getattr(self, "_wp_dev", None):
+            self.show_info_toast("No Walkplay DAC")
+            self._rebuild_menu(preserve_cursor=True)
+            return
+        self.current_menu = "walkplay_dsp"
+        self.cursor_index = 0
+        self._rebuild_menu(preserve_cursor=False)
+        self.ui.request_render()
+
+    def _open_walkplay_peq(self):
+        self.current_menu = "walkplay_peq"
+        self.cursor_index = 0
+        self._rebuild_menu(preserve_cursor=False)
+        self.ui.request_render()
+
+    def _toggle_walkplay_gain(self):
+        from src.hardware.walkplay_hid import WalkplayHID
+        dev = getattr(self, "_wp_dev", None)
+        if not dev:
+            self.show_info_toast("No Walkplay DAC")
+            return
+        nxt = not getattr(self, "_wp_gain_high", True)
+        try:
+            with WalkplayHID(dev["path"]) as wp:
+                if wp.set_gain_high(nxt):
+                    self._wp_gain_high = nxt
+                    self.show_info_toast("Gain: High" if nxt else "Gain: Low")
+        except Exception:
+            self.show_info_toast("HID Write Error")
+        self._rebuild_menu(preserve_cursor=True)
+
+    def _cycle_walkplay_filter(self, delta: int = 1):
+        from src.hardware.walkplay_hid import WalkplayHID, save_walkplay_profile
+        dev = getattr(self, "_wp_dev", None)
+        if not dev:
+            self.show_info_toast("No Walkplay DAC")
+            return
+        cur = getattr(self, "_wp_filter", 1)
+        nxt = (cur + delta) % 5
+        lbls = {0: "Fast Linear", 1: "Slow Linear", 2: "Fast MinPh", 3: "Slow MinPh", 4: "NOS"}
+        try:
+            with WalkplayHID(dev["path"]) as wp:
+                if wp.set_dac_filter(nxt):
+                    self._wp_filter = nxt
+                    save_walkplay_profile(self.db, dev, dac_filter=nxt)
+                    self.show_info_toast(f"Filter: {lbls[nxt]}")
+        except Exception:
+            self.show_info_toast("HID Write Error")
+        self._rebuild_menu(preserve_cursor=True)
+
+    def _tune_walkplay_preamp(self, delta: int):
+        # Comment (invariant): BGVP MX1 CMD 0x03 quantizes Preamp in integer 1.0 dB steps.
+        from src.hardware.walkplay_hid import WalkplayHID, save_walkplay_profile
+        dev = getattr(self, "_wp_dev", None)
+        if not dev:
+            return
+        cur = float(getattr(self, "_wp_preamp", 0.0))
+        nxt = float(max(-12, min(6, int(round(cur)) + delta)))
+        try:
+            with WalkplayHID(dev["path"]) as wp:
+                if wp.set_preamp(nxt):
+                    self._wp_preamp = nxt
+                    save_walkplay_profile(self.db, dev, preamp=nxt)
+        except Exception:
+            self.show_info_toast("HID Write Error")
+        self._rebuild_menu(preserve_cursor=True)
+
+    def _toggle_walkplay_peq(self):
+        from src.hardware.walkplay_hid import WalkplayHID, save_walkplay_profile
+        dev = getattr(self, "_wp_dev", None)
+        if not dev:
+            self.show_info_toast("No Walkplay DAC")
+            return
+        nxt = not getattr(self, "_wp_peq_en", True)
+        try:
+            with WalkplayHID(dev["path"]) as wp:
+                if wp.set_peq_enable(nxt):
+                    self._wp_peq_en = nxt
+                    save_walkplay_profile(self.db, dev, peq_en=nxt)
+                    self.show_info_toast("DAC PEQ: ON" if nxt else "DAC PEQ: OFF")
+        except Exception:
+            self.show_info_toast("HID Write Error")
+        self._rebuild_menu(preserve_cursor=True)
+
+    def _cycle_walkplay_preset(self, delta: int = 1):
+        from src.hardware.walkplay_hid import WalkplayHID, save_walkplay_profile
+        dev = getattr(self, "_wp_dev", None)
+        if not dev:
+            self.show_info_toast("No Walkplay DAC")
+            return
+        opts = ["flat", "bass", "vocal", "warm", "air"]
+        cur = self.db.get_setting("walkplay_preset", "flat")
+        idx = (opts.index(cur) + delta) % len(opts) if cur in opts else 0
+        nxt = opts[idx]
+        try:
+            with WalkplayHID(dev["path"]) as wp:
+                if wp.apply_preset(nxt):
+                    self.db.set_setting("walkplay_preset", nxt)
+                    self._wp_peq_en = wp.read_peq_enable()
+                    self._wp_bands = [b for i in range(8) if (b := wp.read_band(i)) is not None]
+                    save_walkplay_profile(self.db, dev, peq_en=self._wp_peq_en, bands=self._wp_bands)
+                    self.show_info_toast(f"PEQ: {nxt.title()} (RAM)")
+        except Exception:
+            self.show_info_toast("HID Write Error")
+        self._rebuild_menu(preserve_cursor=True)
+
+    def _open_walkplay_band(self, band_idx: int):
+        self._wp_band_idx = band_idx
+        self.current_menu = "walkplay_band"
+        self.cursor_index = 0
+        self._rebuild_menu(preserve_cursor=False)
+        self.ui.request_render()
+
+    def _write_wp_band_param(self, band_idx: int, freq: int, q: float, gain: float, ftype: int):
+        from src.hardware.walkplay_hid import WalkplayHID, save_walkplay_profile
+        dev = getattr(self, "_wp_dev", None)
+        bands = getattr(self, "_wp_bands", [])
+        if not dev or band_idx >= len(bands):
+            return
+        try:
+            with WalkplayHID(dev["path"]) as wp:
+                if wp.write_band(band_idx, freq, q, gain, ftype):
+                    bands[band_idx].update({"freq": freq, "q": q, "gain": gain, "ftype": ftype})
+                    self.db.set_setting("walkplay_preset", "custom")
+                    save_walkplay_profile(self.db, dev, bands=bands)
+        except Exception:
+            self.show_info_toast("HID Write Error")
+        self._rebuild_menu(preserve_cursor=True)
+
+    def _tune_walkplay_band(self, band_idx: int, delta: int):
+        bands = getattr(self, "_wp_bands", [])
+        if band_idx >= len(bands):
+            return
+        b = bands[band_idx]
+        new_gain = max(-12.0, min(12.0, round((b["gain"] + delta * 0.5) * 2.0) / 2.0))
+        self._write_wp_band_param(band_idx, b["freq"], b["q"], new_gain, b["ftype"])
+
+    def _tune_walkplay_band_freq(self, band_idx: int, delta: int):
+        bands = getattr(self, "_wp_bands", [])
+        if band_idx >= len(bands):
+            return
+        b = bands[band_idx]
+        cur_f = int(b["freq"])
+        step = 5 if cur_f < 100 else (10 if cur_f < 300 else (25 if cur_f < 1000 else (100 if cur_f < 4000 else 250)))
+        new_f = max(20, min(20000, cur_f + delta * step))
+        self._write_wp_band_param(band_idx, new_f, b["q"], b["gain"], b["ftype"])
+
+    def _tune_walkplay_band_q(self, band_idx: int, delta: int):
+        bands = getattr(self, "_wp_bands", [])
+        if band_idx >= len(bands):
+            return
+        b = bands[band_idx]
+        step = 0.05 if b["q"] < 2.0 else 0.1
+        new_q = max(0.30, min(10.0, round((b["q"] + delta * step) * 20.0) / 20.0))
+        self._write_wp_band_param(band_idx, b["freq"], new_q, b["gain"], b["ftype"])
+
+    def _cycle_walkplay_band_type(self, band_idx: int, delta: int = 1):
+        bands = getattr(self, "_wp_bands", [])
+        if band_idx >= len(bands):
+            return
+        b = bands[band_idx]
+        opts = [2, 1, 3]
+        idx = (opts.index(b["ftype"]) + delta) % len(opts) if b["ftype"] in opts else 0
+        self._write_wp_band_param(band_idx, b["freq"], b["q"], b["gain"], opts[idx])
+
+    def _save_walkplay_flash(self):
+        from src.hardware.walkplay_hid import WalkplayHID
+        dev = getattr(self, "_wp_dev", None)
+        if not dev:
+            self.show_info_toast("No Walkplay DAC")
+            return
+        try:
+            with WalkplayHID(dev["path"]) as wp:
+                if wp.save_to_flash():
+                    self.show_info_toast("Saved to DAC Flash ★")
+                else:
+                    self.show_info_toast("Flash Save Failed")
+        except Exception:
+            self.show_info_toast("HID Write Error")
 
     def _toggle_i2s_dac_swap(self):
         """Toggles Left/Right channel swap strictly for the internal I2S DAC (ignores USB DAC)."""
@@ -1487,12 +1703,21 @@ class AudioSettingsApp(ListMenuApp):
             }
             phy_str = phy_map.get(phy_boost, "Gentle (0x322) ★")
             usb_hw_vol_str = self._format_usb_hw_vol()
+            from src.hardware.walkplay_hid import discover_walkplay_device
+            wp_dev = discover_walkplay_device()
+            wp_lbl = "Ready ★" if wp_dev else "None"
             items = [
                 {
                     "name": "HW Volume",
                     "suffix": usb_hw_vol_str,
                     "on_tune": self._tune_usb_dac_hw_volume,
                     "action": self._refresh_usb_dac_hw_volume
+                },
+                {
+                    "name": "Walkplay DSP",
+                    "suffix": wp_lbl,
+                    "end_indicator": ">" if wp_dev else "",
+                    "action": self._open_walkplay_dsp
                 },
                 {
                     "name": "USB Audio In",
@@ -1540,6 +1765,65 @@ class AudioSettingsApp(ListMenuApp):
                     "action": self._prompt_restore_defaults
                 }
             ]
+        elif self.current_menu == "walkplay_dsp":
+            self.title = "Walkplay DSP"
+            dev = getattr(self, "_wp_dev", None)
+            if not dev:
+                items = [
+                    {"name": "Walkplay DAC", "suffix": "Not Found", "action": lambda: (self._refresh_walkplay_state(toast=True), self._rebuild_menu(preserve_cursor=False))}
+                ]
+            else:
+                fw = getattr(self, "_wp_fw", "?")
+                peq_on = getattr(self, "_wp_peq_en", True)
+                gain_hi = getattr(self, "_wp_gain_high", True)
+                flt_v = getattr(self, "_wp_filter", 1)
+                flt_lbl = {0: "Fast Linear", 1: "Slow Lin ★", 2: "Fast MinPh", 3: "Slow MinPh", 4: "NOS"}.get(flt_v, f"Mode {flt_v}")
+                short_name = dev["name"].replace("BGVP ", "")[:10]
+                items = [
+                    {"name": short_name, "suffix": f"v{fw}", "action": lambda: (self._refresh_walkplay_state(toast=True), self._rebuild_menu(preserve_cursor=True))},
+                    {"name": "DAC Filter", "suffix": flt_lbl, "action": lambda: self._cycle_walkplay_filter(1), "on_tune": self._cycle_walkplay_filter},
+                    {"name": "Gain Mode", "suffix": "High ★" if gain_hi else "Low", "action": self._toggle_walkplay_gain, "on_tune": lambda _d: self._toggle_walkplay_gain()},
+                    {"name": "PEQ", "suffix": "ON ★" if peq_on else "OFF", "end_indicator": ">", "action": self._open_walkplay_peq},
+                    {"name": "Save to DAC", "suffix": "Flash >", "action": self._save_walkplay_flash},
+                ]
+        elif self.current_menu == "walkplay_peq":
+            self.title = "Walkplay PEQ"
+            peq_on = getattr(self, "_wp_peq_en", True)
+            pr = self.db.get_setting("walkplay_preset", "flat")
+            pr_lbl = {"flat": "Flat ★", "bass": "Bass +3.5", "vocal": "Vocal", "warm": "Warm", "air": "Air", "custom": "Custom"}.get(pr, pr.title())
+            pre_db = float(getattr(self, "_wp_preamp", 0.0))
+            items = [
+                {"name": "PEQ Power", "suffix": "ON ★" if peq_on else "OFF", "action": self._toggle_walkplay_peq, "on_tune": lambda _d: self._toggle_walkplay_peq()},
+                {"name": "Preamp", "suffix": f"{int(round(pre_db)):+d}dB", "on_tune": self._tune_walkplay_preamp},
+                {"name": "PEQ Preset", "suffix": pr_lbl, "action": lambda: self._cycle_walkplay_preset(1), "on_tune": self._cycle_walkplay_preset},
+            ]
+            for idx, b in enumerate(getattr(self, "_wp_bands", [])[:8]):
+                f_hz = b["freq"]
+                f_s = f"{f_hz/1000:.1f}k" if f_hz >= 1000 else f"{f_hz}Hz"
+                g_s = f"{b['gain']:+.1f}dB"
+                items.append({
+                    "name": f"B{idx+1} {f_s}",
+                    "suffix": g_s,
+                    "end_indicator": ">",
+                    "action": lambda bi=idx: self._open_walkplay_band(bi),
+                    "on_tune": lambda d, bi=idx: self._tune_walkplay_band(bi, d),
+                })
+        elif self.current_menu == "walkplay_band":
+            bi = getattr(self, "_wp_band_idx", 0)
+            bands = getattr(self, "_wp_bands", [])
+            self.title = f"PEQ Band {bi + 1}"
+            if bi >= len(bands):
+                items = [{"name": "No Band Data", "action": lambda: None}]
+            else:
+                b = bands[bi]
+                ft_lbl = {1: "Low Shelf", 2: "Peaking ★", 3: "High Shelf"}.get(b["ftype"], f"Type {b['ftype']}")
+                f_s = f"{b['freq']/1000:.2f}kHz" if b["freq"] >= 1000 else f"{b['freq']}Hz"
+                items = [
+                    {"name": "Gain", "suffix": f"{b['gain']:+.1f}dB", "on_tune": lambda d, i=bi: self._tune_walkplay_band(i, d)},
+                    {"name": "Freq", "suffix": f_s, "on_tune": lambda d, i=bi: self._tune_walkplay_band_freq(i, d)},
+                    {"name": "Q Factor", "suffix": f"{b['q']:.2f}", "on_tune": lambda d, i=bi: self._tune_walkplay_band_q(i, d)},
+                    {"name": "Filter Type", "suffix": ft_lbl, "action": lambda i=bi: self._cycle_walkplay_band_type(i, 1), "on_tune": lambda d, i=bi: self._cycle_walkplay_band_type(i, d)},
+                ]
         elif self.current_menu == "mic":
             self.title = "Microphone"
             items = [
