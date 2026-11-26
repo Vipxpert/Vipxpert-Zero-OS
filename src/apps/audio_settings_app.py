@@ -668,6 +668,16 @@ class AudioSettingsApp(ListMenuApp):
         app = FRCouplerApp(self.display, self.ui, self.db, parent_app_id="audio_settings")
         await self.ui.switch_app("fr_coupler", fallback_app=app)
 
+    def _trigger_fr_library(self):
+        import asyncio
+        asyncio.create_task(self._open_fr_library())
+
+    async def _open_fr_library(self):
+        """Launches the DRY Saved FR Graphs browser (grouped by Mic Category with # sort cycling)."""
+        from src.apps.fr_coupler_app import FRGraphLibraryApp
+        app = FRGraphLibraryApp(self.display, self.ui, self.db, parent_app_id="audio_settings")
+        await self.ui.switch_app("fr_library", fallback_app=app)
+
     def _trigger_mic_test(self):
         """Launches the non-blocking Real-Time Right Mic -> Left Mic loopback test."""
         import asyncio
@@ -1896,6 +1906,11 @@ class AudioSettingsApp(ListMenuApp):
                     "name": "FR Measure",
                     "suffix": "Sweep >",
                     "action": self._trigger_fr_coupler
+                },
+                {
+                    "name": "Saved Graphs",
+                    "suffix": "Lib >",
+                    "action": self._trigger_fr_library
                 },
                 {
                     "name": "Auto-Tune Best",

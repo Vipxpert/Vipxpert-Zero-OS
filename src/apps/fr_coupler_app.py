@@ -5,12 +5,38 @@ import math
 import os
 import signal
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional
 from src.ui.base_app import BaseApp
+from src.ui.components import ListMenuApp, TextInputModal, CrudListApp
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _DSP_BIN = os.path.join(_REPO_ROOT, "bin", "fr_meas_dsp")
 _EXPORT_DIR = os.path.join(_REPO_ROOT, "fr_measurements")
+_LIB_FILE = os.path.join(_EXPORT_DIR, "library.json")
+_DEFAULT_MICS = ["Onboard I2S", "USB 3.5mm"]
+
+
+def _load_fr_library() -> Dict:
+    os.makedirs(_EXPORT_DIR, exist_ok=True)
+    if os.path.isfile(_LIB_FILE):
+        try:
+            with open(_LIB_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                mics = list(dict.fromkeys(data.get("mics") or _DEFAULT_MICS))
+                graphs = data.get("graphs") if isinstance(data.get("graphs"), list) else []
+                return {"mics": mics, "graphs": graphs}
+        except Exception:
+            pass
+    return {"mics": list(_DEFAULT_MICS), "graphs": []}
+
+
+def _save_fr_library(data: Dict):
+    os.makedirs(_EXPORT_DIR, exist_ok=True)
+    tmp = _LIB_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, _LIB_FILE)
 
 
 class FRCouplerApp(BaseApp):
@@ -35,6 +61,19 @@ class FRCouplerApp(BaseApp):
         self.smooth_oct: int = 12       # 6 | 12 | 24
         self.channel: str = "avg"       # 'avg' | 'L' | 'R'
         self.last_rec_wav = "/tmp/vip_fr_rec.wav"
+        self.loaded_name: str = ""
+        self.loaded_mic: str = ""
+
+    def load_saved_graph(self, entry: Dict):
+        self.points = [float(x) for x in entry.get("points", [])]
+        self.comp_mode = str(entry.get("comp_mode", "none"))
+        self.smooth_oct = int(entry.get("smooth_oct", 12))
+        self.channel = str(entry.get("channel", "avg"))
+        self.noise_db = float(entry.get("noise_db", -120.0))
+        self.gate_passed = entry.get("gate_passed", True)
+        self.loaded_name = str(entry.get("name", ""))
+        self.loaded_mic = str(entry.get("mic", ""))
+        self.status_msg = ""
 
     async def on_start(self):
         self.ui.request_render()
@@ -91,10 +130,13 @@ class FRCouplerApp(BaseApp):
             else:
                 self.ui.request_render()
         elif char == '#' and action == "CLICK":
-            if os.path.isfile(self.last_rec_wav) and self.points:
-                asyncio.create_task(self._export_txt())
+            if self.points:
+                asyncio.create_task(self._start_save_wizard())
             else:
                 self.ui.show_toast("Measure First!", duration=1.4)
+        elif char == '8' and action == "CLICK":
+            lib_app = FRGraphLibraryApp(self.display, self.ui, self.db, parent_app_id="fr_coupler")
+            await self.ui.switch_app("fr_library", fallback_app=lib_app)
 
     async def _run_measurement(self):
         self.measuring = True
@@ -232,17 +274,92 @@ class FRCouplerApp(BaseApp):
         self.snr_db = float(data.get("snr_db", 0.0))
         self.status_msg = ""
 
-    async def _export_txt(self):
-        os.makedirs(_EXPORT_DIR, exist_ok=True)
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        fname = f"fr_{ts}_{self.comp_mode}.txt"
-        fpath = os.path.join(_EXPORT_DIR, fname)
-        await self._analyze_wav(self.last_rec_wav, out_txt=fpath)
-        if os.path.isfile(fpath):
-            self.ui.show_toast(f"Saved {fname[:16]}", duration=1.8)
-        else:
-            self.ui.show_toast("Export Failed", duration=1.5)
-        self.ui.request_render()
+    async def _start_save_wizard(self):
+        """DRY save flow: universal ListMenuApp (Pick/Add Mic) -> TextInputModal (Graph Name)."""
+        lib = _load_fr_library()
+        mics = lib["mics"]
+
+        async def _ask_graph_name(chosen_mic: str):
+            default_name = f"FR {time.strftime('%m%d %H%M')}"
+
+            async def _on_name(name_str: str):
+                clean = (name_str or "").strip() or default_name
+                await self._commit_saved_graph(clean, chosen_mic)
+                await self.ui.switch_app("fr_coupler", fallback_app=self)
+
+            async def _on_cancel():
+                await self.ui.switch_app("fr_coupler", fallback_app=self)
+
+            modal = TextInputModal(
+                self.display, self.ui, f"Name ({chosen_mic[:8]})",
+                on_complete=_on_name, on_cancel=_on_cancel, default_text=default_name
+            )
+            await self.ui.switch_app("fr_name_input", fallback_app=modal)
+
+        async def _add_new_mic():
+            async def _on_mic(mic_str: str):
+                m_clean = (mic_str or "").strip()
+                if m_clean:
+                    cur = _load_fr_library()
+                    if m_clean not in cur["mics"]:
+                        cur["mics"].append(m_clean)
+                        _save_fr_library(cur)
+                    await _ask_graph_name(m_clean)
+                else:
+                    await self.ui.switch_app("fr_coupler", fallback_app=self)
+
+            async def _on_cancel():
+                await self.ui.switch_app("fr_coupler", fallback_app=self)
+
+            modal = TextInputModal(
+                self.display, self.ui, "New Mic Name",
+                on_complete=_on_mic, on_cancel=_on_cancel, default_text=""
+            )
+            await self.ui.switch_app("fr_mic_input", fallback_app=modal)
+
+        mic_items = [
+            {"name": m, "action": (lambda mm=m: asyncio.create_task(_ask_graph_name(mm)))}
+            for m in mics
+        ]
+        static_items = [
+            {"name": "+ Add New Mic", "action": (lambda: asyncio.create_task(_add_new_mic()))}
+        ]
+        picker = ListMenuApp(
+            self.display, self.ui, "Select Mic", mic_items,
+            static_items=static_items, sort_methods=BaseApp.STANDARD_TEXT_SORTS,
+            parent_app_id="fr_coupler"
+        )
+        await self.ui.switch_app("fr_mic_picker", fallback_app=picker)
+
+    async def _commit_saved_graph(self, name: str, mic: str):
+        lib = _load_fr_library()
+        if mic not in lib["mics"]:
+            lib["mics"].append(mic)
+        ts_num = int(time.time())
+        entry = {
+            "id": f"fr_{ts_num}",
+            "name": name,
+            "mic": mic,
+            "ts": ts_num,
+            "comp_mode": self.comp_mode,
+            "smooth_oct": self.smooth_oct,
+            "channel": self.channel,
+            "noise_db": round(self.noise_db, 2),
+            "gate_passed": self.gate_passed,
+            "points": [round(float(x), 2) for x in self.points[:120]],
+        }
+        lib["graphs"].append(entry)
+        _save_fr_library(lib)
+        self.loaded_name = name
+        self.loaded_mic = mic
+        if os.path.isfile(self.last_rec_wav):
+            safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:24]
+            fpath = os.path.join(_EXPORT_DIR, f"{safe}_{ts_num}.txt")
+            try:
+                await self._analyze_wav(self.last_rec_wav, out_txt=fpath)
+            except Exception:
+                pass
+        self.ui.show_toast(f"Saved: {name[:14]}", duration=1.6)
 
     def _draw_state(self):
         self.display.clear()
@@ -313,3 +430,99 @@ class FRCouplerApp(BaseApp):
             d.text((88, 54), f"+/-{int(y_span)}", font=font, fill=1)
 
         self.display.show()
+
+
+class FRGraphLibraryApp(ListMenuApp):
+    """DRY Saved FR Graphs browser grouped by Mic Category with universal '#' sort-order cycling."""
+
+    def __init__(self, display, ui_manager, db, parent_app_id: str = "audio_settings"):
+        self.db = db
+        sort_modes = {
+            "A-Z": (lambda x: x.get("name", "").lower(), False),
+            "Z-A": (lambda x: x.get("name", "").lower(), True),
+            "Count": (lambda x: x.get("_count", 0), True),
+        }
+        super().__init__(
+            display, ui_manager, "FR Graphs (Mic)", [],
+            sort_methods=sort_modes, parent_app_id=parent_app_id
+        )
+        self._rebuild_categories()
+
+    async def on_start(self):
+        self._rebuild_categories()
+        await super().on_start()
+
+    def _rebuild_categories(self):
+        lib = _load_fr_library()
+        graphs = lib["graphs"]
+        counts: Dict[str, int] = {}
+        for g in graphs:
+            m = g.get("mic", "Unknown")
+            counts[m] = counts.get(m, 0) + 1
+        all_mics = list(dict.fromkeys(lib["mics"] + list(counts.keys())))
+        items = []
+        for m in all_mics:
+            c = counts.get(m, 0)
+            items.append({
+                "name": m,
+                "suffix": f"({c})",
+                "_count": c,
+                "action": (lambda mm=m: asyncio.create_task(self._open_category(mm)))
+            })
+        static_items = [
+            {
+                "name": "All Graphs",
+                "suffix": f"({len(graphs)})",
+                "action": (lambda: asyncio.create_task(self._open_category(None)))
+            }
+        ]
+        self.update_items(items, preserve_cursor=True, new_static_items=static_items)
+
+    async def _open_category(self, mic_filter: Optional[str]):
+        lib = _load_fr_library()
+        graphs = [g for g in lib["graphs"] if mic_filter is None or g.get("mic") == mic_filter]
+        title = f"Mic: {mic_filter[:10]}" if mic_filter else "All FR Graphs"
+
+        def _build_rows(g_list):
+            rows = []
+            for g in g_list:
+                rows.append({
+                    "id": g.get("id", ""),
+                    "name": g.get("name", "Untitled"),
+                    "suffix": g.get("mic", "")[:6] if mic_filter is None else "",
+                    "_ts": int(g.get("ts", 0)),
+                    "_mic": str(g.get("mic", "")).lower(),
+                    "_entry": g,
+                    "action": (lambda entry=g: asyncio.create_task(self._open_saved_graph(entry)))
+                })
+            return rows
+
+        def _on_delete(item):
+            gid = item.get("id")
+            cur = _load_fr_library()
+            cur["graphs"] = [g for g in cur["graphs"] if g.get("id") != gid]
+            _save_fr_library(cur)
+            self.ui.show_toast("Deleted Graph", duration=1.2)
+            remaining = [g for g in cur["graphs"] if mic_filter is None or g.get("mic") == mic_filter]
+            crud.raw_dynamic_items = _build_rows(remaining)
+            crud._apply_mode("NORMAL")
+
+        sort_modes = {
+            "Newest": (lambda x: x.get("_ts", 0), True),
+            "Oldest": (lambda x: x.get("_ts", 0), False),
+            "A-Z": (lambda x: x.get("name", "").lower(), False),
+            "Z-A": (lambda x: x.get("name", "").lower(), True),
+            "Mic": (lambda x: (x.get("_mic", ""), -x.get("_ts", 0)), False),
+        }
+        crud = CrudListApp(
+            self.display, self.ui, title, _build_rows(graphs),
+            crud_config={"on_delete": _on_delete},
+            sort_methods=sort_modes, default_sort_key="Newest",
+            parent_app_id="fr_library"
+        )
+        await self.ui.switch_app("fr_library_cat", fallback_app=crud)
+
+    async def _open_saved_graph(self, entry: Dict):
+        app = FRCouplerApp(self.display, self.ui, self.db, parent_app_id="fr_library_cat")
+        app.load_saved_graph(entry)
+        await self.ui.switch_app("fr_coupler", fallback_app=app)
