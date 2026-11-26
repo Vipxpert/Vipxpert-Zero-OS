@@ -658,6 +658,16 @@ class AudioSettingsApp(ListMenuApp):
         viewer = LockScreenApp(self.display, self.ui, standalone_scene="mic_ultrasonic", parent_app_id="audio_settings")
         await self.ui.switch_app("mic_scope_viewer", fallback_app=viewer)
 
+    def _trigger_fr_coupler(self):
+        import asyncio
+        asyncio.create_task(self._open_fr_coupler())
+
+    async def _open_fr_coupler(self):
+        """Launches the IEC-711 Acoustic Coupler / FR Measurement app from Audio Settings."""
+        from src.apps.fr_coupler_app import FRCouplerApp
+        app = FRCouplerApp(self.display, self.ui, self.db, parent_app_id="audio_settings")
+        await self.ui.switch_app("fr_coupler", fallback_app=app)
+
     def _trigger_mic_test(self):
         """Launches the non-blocking Real-Time Right Mic -> Left Mic loopback test."""
         import asyncio
@@ -1881,6 +1891,11 @@ class AudioSettingsApp(ListMenuApp):
                     "name": "Ultrasonic Scope",
                     "suffix": "Open >",
                     "action": lambda: asyncio.create_task(self._open_mic_scope())
+                },
+                {
+                    "name": "FR Measure",
+                    "suffix": "Sweep >",
+                    "action": self._trigger_fr_coupler
                 },
                 {
                     "name": "Auto-Tune Best",

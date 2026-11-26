@@ -12,9 +12,29 @@ path = "src/bin/viz_dsp.rs"
 name = "mic_scope_dsp"
 path = "src/bin/mic_scope_dsp.rs"
 
+[[bin]]
+name = "hw_bench"
+path = "src/bin/hw_bench.rs"
+
+[[bin]]
+name = "cart_wasm4"
+path = "src/bin/cart_wasm4.rs"
+
+[[bin]]
+name = "cart_libretro"
+path = "src/bin/cart_libretro.rs"
+
+[[bin]]
+name = "fr_meas_dsp"
+path = "src/bin/fr_meas_dsp.rs"
+
+[dependencies]
+# Comment (constraint): Disable default wat/wast/memory64 features; WASM-4 cartridges are binary 32-bit .wasm only and dropping wat avoids compiling 15+ parser crates on H618.
+wasmi = { version = "2.0.2", default-features = false, features = ["stable", "std", "validate", "auto-dispatch"] }
+
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1
+# Comment (constraint): Use thin LTO (parallel) instead of fat lto=true + codegen-units=1, which stalls single-threaded LLVM linking of wasmi on H618 for >5 minutes.
+lto = "thin"
 panic = "abort"
 strip = true
