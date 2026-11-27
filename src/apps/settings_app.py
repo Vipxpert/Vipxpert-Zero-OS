@@ -234,7 +234,7 @@ class SettingsApp(ListMenuApp):
                     self.display.dither_hi = self._gcal_hi
                 self.ui.request_render()
             elif action == "CLICK" and char == "0":
-                algos = ["bayer8", "bayer4", "bayer2", "cluster", "ign", "floyd", "temporal"]
+                algos = ["bayer8", "bayer4", "bayer2", "cluster", "ign", "floyd", "atkinson", "sierra", "temporal", "bluenoise"]
                 idx = (algos.index(self._gcal_algo) + 1) % len(algos) if self._gcal_algo in algos else 0
                 self._gcal_algo = algos[idx]
                 self.display.dither_algo = self._gcal_algo
@@ -446,8 +446,8 @@ class SettingsApp(ListMenuApp):
         self.ui.request_render()
 
     def _tune_dither_algo(self, direction: int = 1):
-        """Steps Universal Gray Engine dither algorithm across all 7 kernels live."""
-        opts = ["bayer8", "bayer4", "bayer2", "cluster", "ign", "floyd", "temporal"]
+        """Steps Universal Gray Engine dither algorithm across all dither kernels live."""
+        opts = ["bayer8", "bayer4", "bayer2", "cluster", "ign", "floyd", "atkinson", "sierra", "temporal", "bluenoise"]
         cur = self.db.get_setting("oled_dither_algo", getattr(self.display, "dither_algo", "bayer8"))
         idx = (opts.index(cur) + direction) % len(opts) if cur in opts else 0
         nxt = opts[idx]

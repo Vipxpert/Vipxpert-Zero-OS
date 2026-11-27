@@ -138,7 +138,7 @@ class Display:
                     init_dt = float(_rows["oled_pwm_dt"])
                 if _rows.get("oled_gray_mode") in ("hybrid", "pwm", "dithering", "off"):
                     self.gray_mode = _rows["oled_gray_mode"]
-                if _rows.get("oled_dither_algo") in ("bayer8", "bayer4", "bayer2", "cluster", "ign", "floyd", "temporal"):
+                if _rows.get("oled_dither_algo") in ("bayer8", "bayer4", "bayer2", "cluster", "ign", "floyd", "atkinson", "sierra", "temporal", "bluenoise"):
                     self.dither_algo = _rows["oled_dither_algo"]
                 if "oled_dither_lo" in _rows:
                     self.dither_lo = max(4, min(96, int(_rows["oled_dither_lo"])))
@@ -785,7 +785,10 @@ class Display:
                         if len(self._pwm_hw_log) > 3200:
                             self._pwm_hw_log = self._pwm_hw_log[-3200:]
                     # Stage: Deterministic Bus-Throughput Hybrid PWM Budget Controller + 2-Second PWM-DIAG Telemetry
-                    if getattr(self, "_is_fullscreen_pwm", False):
+                    if not getattr(self, "_is_fullscreen_pwm", False):
+                        if hasattr(self, "_mot_extra_b"):
+                            self._mot_extra_b *= 0.90
+                    else:
                         # Comment (decision): Compute the Hybrid PWM byte budget deterministically from measured hardware bus throughput (d_bytes / io_ms), non-IO overhead (prep + lock), and ph2 frame-motion extra bytes; avoids step-heuristic pinning (CR-782 pinned at 48B despite 1.43ms io) and scales automatically across 400kHz/800kHz I2C and SPI boards.
                         dt_ms = (b_dt * 1000.0) if pages_lo is not None else 6.452
                         io_ms = f_meta[1]
@@ -1145,46 +1148,78 @@ class Display:
             i_lo = ImageOps.invert(lo_copy.convert("L")).convert("1") if self.invert_mode else lo_copy
             c_ph1 = self._compile_page_buffers(i_ph1, c_hi)
             c_lo = self._compile_page_buffers(i_lo, c_ph1)
-            # Comment (invariant): Enforce the closed-loop hardware-adaptive Hybrid PWM-vs-Dither budget (read from shm[36:40], updated by OLED_Compositor from measured io+prep+lock headroom vs oled_pwm_dt) directly on exact SH1106 vertical-page XOR bytes so any board/bus stays at 0 overruns.
+            # Comment (invariant): Enforce the closed-loop hardware-adaptive Hybrid PWM-vs-Dither budget (read from shm[36:40]); keep per-page Hybrid PWM active when pwm_budget >= 80 so _hardware_render_loop scales up to full bus capacity (~250-290B), and promote to whole-frame dither only under extreme motion saturation (pwm_budget < 80) with a 1.0s hold and 224B probe recovery.
             _force_pwm = getattr(self, "_gray_force_pwm", False)
             self._gray_force_pwm = False
             if gray_planes and not _force_pwm and getattr(self, "gray_mode", "hybrid") == "hybrid" and hasattr(self, "_apply_dither_img"):
                 _shm_b = getattr(self, "_shm", None)
-                pwm_budget = struct.unpack("<I", _shm_b[36:40])[0] if (_shm_b is not None and len(_shm_b) >= 40) else 144
+                pwm_budget = struct.unpack("<I", _shm_b[36:40])[0] if (_shm_b is not None and len(_shm_b) >= 40) else 224
                 if not (48 <= pwm_budget <= 1024):
-                    pwm_budget = 144
-                p_costs = []
-                total_pwm_b = 0
-                for p in range(8):
-                    x_b = (int.from_bytes(c_hi[p][1], "little") ^ int.from_bytes(c_lo[p][1], "little")).to_bytes(128, "little")
-                    cost = 128 - x_b.count(0)
-                    if cost > 0:
-                        p_costs.append((cost, p))
-                        total_pwm_b += cost
-                if total_pwm_b > pwm_budget:
-                    c_hi = list(c_hi)
-                    c_ph1 = list(c_ph1)
-                    c_lo = list(c_lo)
-                    p_costs.sort(reverse=True)
-                    for cost, p in p_costs:
-                        if total_pwm_b <= pwm_budget:
-                            break
-                        y0 = p * 8
-                        box = (0, y0, 128, y0 + 8)
-                        b0 = hi_img.crop(box).convert("L").tobytes()
-                        b1 = i_ph1.crop(box).convert("L").tobytes()
-                        b2 = i_lo.crop(box).convert("L").tobytes()
-                        strip_l = Image.frombytes("L", (128, 8), bytes((a + b + c) // 3 for a, b, c in zip(b0, b1, b2)))
-                        d_px = self._apply_dither_img(strip_l).convert("L").tobytes()
-                        pg_b = bytes(
-                            (1 if d_px[x] else 0) | (2 if d_px[128 + x] else 0) | (4 if d_px[256 + x] else 0) | (8 if d_px[384 + x] else 0)
-                            | (16 if d_px[512 + x] else 0) | (32 if d_px[640 + x] else 0) | (64 if d_px[768 + x] else 0) | (128 if d_px[896 + x] else 0)
-                            for x in range(128)
-                        )
-                        c_hi[p] = (True, pg_b)
-                        c_ph1[p] = (True, pg_b)
-                        c_lo[p] = (True, pg_b)
-                        total_pwm_b -= cost
+                    pwm_budget = 224
+                now_h = time.monotonic()
+                hold_until = getattr(self, "_hybrid_dither_hold_until", 0.0)
+                in_dither = getattr(self, "_hybrid_in_dither", False)
+                if in_dither and now_h >= hold_until:
+                    self._hybrid_in_dither = False
+                    in_dither = False
+                    if pwm_budget < 80:
+                        pwm_budget = 224
+                        if _shm_b is not None and len(_shm_b) >= 40:
+                            _shm_b[36:40] = struct.pack("<I", 224)
+                elif not in_dither and pwm_budget < 80:
+                    self._hybrid_dither_hold_until = now_h + 1.0
+                    self._hybrid_in_dither = True
+                    in_dither = True
+                if in_dither:
+                    src_l = gray_planes[3] if (len(gray_planes) >= 4 and gray_planes[3] is not None) else None
+                    if src_l is not None:
+                        if self.invert_mode:
+                            src_l = ImageOps.invert(src_l)
+                        d_img = self._apply_dither_img(src_l)
+                        c_hi = self._compile_page_buffers(d_img, getattr(self, "_ui_pages_hi", None))
+                        self._ui_pages_hi = c_hi
+                        c_ph1 = None
+                        c_lo = None
+                else:
+                    p_costs = []
+                    total_pwm_b = 0
+                    for p in range(8):
+                        x_b = (int.from_bytes(c_hi[p][1], "little") ^ int.from_bytes(c_lo[p][1], "little")).to_bytes(128, "little")
+                        cost = 128 - x_b.count(0)
+                        if cost > 0:
+                            p_costs.append((cost, p))
+                            total_pwm_b += cost
+                    if total_pwm_b > pwm_budget:
+                        c_hi = list(c_hi)
+                        c_ph1 = list(c_ph1)
+                        c_lo = list(c_lo)
+                        src_l = gray_planes[3] if (len(gray_planes) >= 4 and gray_planes[3] is not None) else None
+                        if src_l is not None and self.invert_mode:
+                            src_l = ImageOps.invert(src_l)
+                        full_d_px = self._apply_dither_img(src_l).convert("L").tobytes() if src_l is not None else None
+                        p_costs.sort(reverse=True)
+                        for cost, p in p_costs:
+                            if total_pwm_b <= pwm_budget:
+                                break
+                            y0 = p * 8
+                            if full_d_px is not None:
+                                d_px = full_d_px[y0 * 128 : (y0 + 8) * 128]
+                            else:
+                                box = (0, y0, 128, y0 + 8)
+                                b0 = hi_img.crop(box).convert("L").tobytes()
+                                b1 = i_ph1.crop(box).convert("L").tobytes()
+                                b2 = i_lo.crop(box).convert("L").tobytes()
+                                strip_l = Image.frombytes("L", (128, 8), bytes((a + b + c) // 3 for a, b, c in zip(b0, b1, b2)))
+                                d_px = self._apply_dither_img(strip_l).convert("L").tobytes()
+                            pg_b = bytes(
+                                (1 if d_px[x] else 0) | (2 if d_px[128 + x] else 0) | (4 if d_px[256 + x] else 0) | (8 if d_px[384 + x] else 0)
+                                | (16 if d_px[512 + x] else 0) | (32 if d_px[640 + x] else 0) | (64 if d_px[768 + x] else 0) | (128 if d_px[896 + x] else 0)
+                                for x in range(128)
+                            )
+                            c_hi[p] = (True, pg_b)
+                            c_ph1[p] = (True, pg_b)
+                            c_lo[p] = (True, pg_b)
+                            total_pwm_b -= cost
 
         shm = getattr(self, "_shm", None)
         if shm is not None:
@@ -1198,8 +1233,8 @@ class Display:
             ver = (struct.unpack("<I", shm[0:4])[0] + 1) & 0x7FFFFFFF
             if ver == 0:
                 ver = 1
-            # Stage: Full-Screen PWM Flag (Sets shm_pwm=2 when gray_planes are active so all 8 pages flush across all 3 PWM phases)
-            shm_pwm_flag = 2 if gray_planes else (1 if c_lo is not None else 0)
+            # Stage: Full-Screen PWM Flag (Sets shm_pwm=2 when gray_planes are active and not promoted to whole-frame Hybrid dithering)
+            shm_pwm_flag = 2 if (gray_planes and c_lo is not None) else (1 if c_lo is not None else 0)
             shm[0:20] = struct.pack("<IIIII", ver, getattr(self, "_frame_seq", 0), shm_pwm_flag, 1 if self.is_asleep else 0, w_slot)
             
     def show_test_screen(self):
@@ -1285,7 +1320,7 @@ class Display:
         """Updates universal Gray Engine parameters live and invalidates cached dither tiles/LUTs."""
         if gray_mode in ("hybrid", "pwm", "dithering", "off"):
             self.gray_mode = gray_mode
-        if dither_algo in ("bayer8", "bayer4", "bayer2", "cluster", "ign", "floyd", "temporal"):
+        if dither_algo in ("bayer8", "bayer4", "bayer2", "cluster", "ign", "floyd", "atkinson", "sierra", "temporal", "bluenoise"):
             self.dither_algo = dither_algo
         if dither_lo is not None:
             self.dither_lo = max(4, min(96, int(dither_lo)))
@@ -1356,7 +1391,60 @@ class Display:
                 m_t = [[64, 192], [192, 64]]
                 rb = [bytes(m_t[y][x & 1] for x in range(w)) for y in range(2)]
                 tile_img = Image.frombytes("L", (w, h), b"".join(rb * ((h + 1) // 2))[:w * h])
-            elif algo != "floyd":
+            elif algo == "bluenoise":
+                # Comment (quality): True 16x16 Void-and-Cluster Blue-Noise (Ulichney, sigma=1.5, toroidal) tiled 1:1; produces evenly spaced stipple with zero Floyd-Steinberg worms and zero Bayer grid banding.
+                bn_tile = getattr(self, "_bluenoise_16", None)
+                if bn_tile is None:
+                    import math
+                    n = 16
+                    g_lut = [
+                        [math.exp(-((min(dx, n - dx) ** 2 + min(dy, n - dy) ** 2) / 4.5)) for dx in range(n)]
+                        for dy in range(n)
+                    ]
+                    def _add_e(en, px, py, sgn):
+                        for yy in range(n):
+                            row_g = g_lut[(yy - py) & 15]
+                            base = yy * n
+                            for xx in range(n):
+                                en[base + xx] += sgn * row_g[(xx - px) & 15]
+                    # Deterministic initial binary pattern (32 well-spaced seeds) + cluster/void relaxation
+                    pat = [0] * 256
+                    en = [0.0] * 256
+                    seed = 0x5F3759DF
+                    ones = 0
+                    while ones < 32:
+                        seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
+                        idx = (seed >> 16) & 255
+                        if not pat[idx]:
+                            pat[idx] = 1
+                            _add_e(en, idx & 15, idx >> 4, 1.0)
+                            ones += 1
+                    for _ in range(24):
+                        c_idx = max((i for i in range(256) if pat[i]), key=lambda i: en[i])
+                        pat[c_idx] = 0
+                        _add_e(en, c_idx & 15, c_idx >> 4, -1.0)
+                        v_idx = min((i for i in range(256) if not pat[i]), key=lambda i: en[i])
+                        pat[v_idx] = 1
+                        _add_e(en, v_idx & 15, v_idx >> 4, 1.0)
+                        if v_idx == c_idx:
+                            break
+                    rank = [0] * 256
+                    p1, e1 = list(pat), list(en)
+                    for r in range(ones - 1, -1, -1):
+                        c_idx = max((i for i in range(256) if p1[i]), key=lambda i: e1[i])
+                        p1[c_idx] = 0
+                        _add_e(e1, c_idx & 15, c_idx >> 4, -1.0)
+                        rank[c_idx] = r
+                    p2, e2 = list(pat), list(en)
+                    for r in range(ones, 256):
+                        v_idx = min((i for i in range(256) if not p2[i]), key=lambda i: e2[i])
+                        p2[v_idx] = 1
+                        _add_e(e2, v_idx & 15, v_idx >> 4, 1.0)
+                        rank[v_idx] = r
+                    bn_tile = [bytes(rank[y * n + (x & 15)] for x in range(w)) for y in range(n)]
+                    self._bluenoise_16 = bn_tile
+                tile_img = Image.frombytes("L", (w, h), b"".join(bn_tile * ((h + 15) // 16))[:w * h])
+            elif algo not in ("floyd", "atkinson", "sierra"):
                 m8 = [
                     [ 0, 32,  8, 40,  2, 34, 10, 42], [48, 16, 56, 24, 50, 18, 58, 26],
                     [12, 44,  4, 36, 14, 46,  6, 38], [60, 28, 52, 20, 62, 30, 54, 22],
@@ -1370,6 +1458,88 @@ class Display:
         mapped = g_img.point(cache[2], mode="L")
         if algo == "floyd":
             return mapped.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
+        if algo == "atkinson":
+            # Comment (quality): Atkinson diffuses 6/8 (75%) of error to preserve sharp 1-bit detail while preventing Floyd-Steinberg worm chains.
+            buf = list(mapped.tobytes())
+            out = bytearray(w * h)
+            w_m1 = w - 1
+            w_m2 = w - 2
+            h_m1 = h - 1
+            h_m2 = h - 2
+            for y in range(h):
+                row = y * w
+                n1 = row + w
+                n2 = n1 + w
+                has_n1 = y < h_m1
+                has_n2 = y < h_m2
+                for x in range(w):
+                    idx = row + x
+                    v = buf[idx]
+                    if v >= 128:
+                        out[idx] = 255
+                        err = v - 255
+                    else:
+                        err = v
+                    e = err >> 3
+                    if e:
+                        if x < w_m1:
+                            buf[idx + 1] += e
+                            if x < w_m2:
+                                buf[idx + 2] += e
+                        if has_n1:
+                            if x > 0:
+                                buf[n1 + x - 1] += e
+                            buf[n1 + x] += e
+                            if x < w_m1:
+                                buf[n1 + x + 1] += e
+                        if has_n2:
+                            buf[n2 + x] += e
+            return Image.frombytes("L", (w, h), bytes(out)).point(cache[3], mode="1")
+        if algo == "sierra":
+            # Comment (quality): Serpentine Sierra Lite ([2/4, 1/4, 1/4] with alternating L->R / R->L scan) keeps 100% tonal accuracy while breaking up Floyd-Steinberg diagonal worms.
+            buf = list(mapped.tobytes())
+            out = bytearray(w * h)
+            w_m1 = w - 1
+            h_m1 = h - 1
+            for y in range(h):
+                row = y * w
+                n1 = row + w
+                has_n1 = y < h_m1
+                if (y & 1) == 0:
+                    for x in range(w):
+                        idx = row + x
+                        v = buf[idx]
+                        if v >= 128:
+                            out[idx] = 255
+                            err = v - 255
+                        else:
+                            err = v
+                        e1 = err >> 2
+                        if e1:
+                            if x < w_m1:
+                                buf[idx + 1] += err >> 1
+                            if has_n1:
+                                if x > 0:
+                                    buf[n1 + x - 1] += e1
+                                buf[n1 + x] += e1
+                else:
+                    for x in range(w_m1, -1, -1):
+                        idx = row + x
+                        v = buf[idx]
+                        if v >= 128:
+                            out[idx] = 255
+                            err = v - 255
+                        else:
+                            err = v
+                        e1 = err >> 2
+                        if e1:
+                            if x > 0:
+                                buf[idx - 1] += err >> 1
+                            if has_n1:
+                                if x < w_m1:
+                                    buf[n1 + x + 1] += e1
+                                buf[n1 + x] += e1
+            return Image.frombytes("L", (w, h), bytes(out)).point(cache[3], mode="1")
         return ImageChops.subtract(mapped, cache[1]).point(cache[3], mode="1")
 
     def _resolve_gray_mode(self, mode_override: str = None, allow_off_fallback: bool = False) -> str:
@@ -1495,8 +1665,11 @@ class Display:
         lo_full = prev_planes[1].copy() if prev_planes else self.image.copy()
         ph1_full.paste(b_ph1, (x0, y0))
         lo_full.paste(b_lo, (x0, y0))
+        # Comment (invariant): Keep the full 8-bit source luminance canvas so Display.show() Hybrid fallback dithers true 8-bit luma continuously across all 8 pages instead of double-thresholding 1-bit PWM planes per 8px strip.
+        src_full = prev_planes[3].copy() if (prev_planes and len(prev_planes) >= 4 and prev_planes[3] is not None) else Image.new("L", (128, 64), 0)
+        src_full.paste(g_img, (x0, y0))
         prev_sig = prev_planes[2] if prev_planes else None
-        self._pwm_gray_planes = (ph1_full, lo_full, (prev_sig, hash(gray_bytes)))
+        self._pwm_gray_planes = (ph1_full, lo_full, (prev_sig, hash(gray_bytes)), src_full)
         self.has_active_marquee = True
 
     def render_wireframe_3d(self, vertices, edges, angle_x: float, angle_y: float, angle_z: float = 0.0, scale: float = 18.0, cx: int = 64, cy: int = 32, faces=None, dist: float = 4.2):
