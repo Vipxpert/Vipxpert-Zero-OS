@@ -171,11 +171,55 @@ class CartridgeHostApp(BaseApp):
         # Comment (invariant): Offset 28 is worker status; pack host zoom/pan at offsets 32, 36, 40.
         struct.pack_into("<Iii", self._shm_mm, 32, int(self._zoom_pct), int(self._pan_x), int(self._pan_y))
 
+    def _get_db(self):
+        return getattr(self.ui, "db", None) or getattr(getattr(self.ui, "os_kernel", None), "db", None)
+
+    def _cart_view_key(self) -> str:
+        entry = str(self.cart_spec.get("entry") or self.cart_spec.get("name") or "default")
+        return f"cart_view:{os.path.basename(entry)}"
+
+    def _load_cart_view(self):
+        db = self._get_db()
+        if not db:
+            return
+        try:
+            raw = db.get_setting(self._cart_view_key(), "")
+            if not raw:
+                return
+            data = json.loads(raw)
+            if "scale_mode" in data:
+                self._scale_mode = max(0, min(3, int(data["scale_mode"])))
+            if "zoom_pct" in data:
+                zp = int(data["zoom_pct"])
+                self._zoom_pct = zp if zp in (3, 4) else max(10, min(400, zp))
+            if "pan_x" in data:
+                self._pan_x = max(-256, min(256, int(data["pan_x"])))
+            if "pan_y" in data:
+                self._pan_y = max(-256, min(256, int(data["pan_y"])))
+        except Exception as e:
+            print(f"[Cartridges] Failed to load saved view: {e}", flush=True)
+
+    def _save_cart_view(self):
+        db = self._get_db()
+        if not db:
+            return
+        try:
+            payload = json.dumps({
+                "scale_mode": int(self._scale_mode),
+                "zoom_pct": int(self._zoom_pct),
+                "pan_x": int(self._pan_x),
+                "pan_y": int(self._pan_y),
+            })
+            db.set_setting(self._cart_view_key(), payload)
+        except Exception as e:
+            print(f"[Cartridges] Failed to save view: {e}", flush=True)
+
     async def on_start(self):
         self._error_msg = None
         self._buttons_down = 0
         self._w4_gamepad1 = 0
         self._last_seq = 0
+        self._load_cart_view()
 
         shm_path = f"/dev/shm/vipxpert_cart_{os.getpid()}_{id(self) & 0xFFFF:x}.shm"
         self._shm_path = shm_path
@@ -249,6 +293,7 @@ class CartridgeHostApp(BaseApp):
             pass
 
     async def on_stop(self):
+        self._save_cart_view()
         if self._pump_task and not self._pump_task.done():
             self._pump_task.cancel()
             try:
@@ -316,7 +361,7 @@ class CartridgeHostApp(BaseApp):
             if len(self._error_msg) > 20:
                 self.display.has_active_marquee = True
             return
-        self.display.draw_gray_frame(0, 0, OLED_W, OLED_H, self._last_fb)
+        self.display.draw_gray_frame(0, 0, OLED_W, OLED_H, self._last_fb, scaled_source=True)
 
     async def handle_key(self, action: str, key: str):
         if self._zoom_mode:
@@ -347,13 +392,13 @@ class CartridgeHostApp(BaseApp):
             if key == '0' and action == 'CLICK':
                 # Comment (input): '*' is globally reserved for Lock Screen; use '0' inside Zoom & Pan mode to cycle fit and edge-snap presets.
                 presets = (
-                    ("Fill 100%", 100, 0, 0),
-                    ("Fit 53%", 53, 0, 0),
-                    ("1:1 200%", 200, 0, 0),
-                    ("Edge Top", max(100, self._zoom_pct), 0, -1000),
-                    ("Edge Bottom", max(100, self._zoom_pct), 0, 1000),
-                    ("Edge Left", max(150, self._zoom_pct), -1000, 0),
-                    ("Edge Right", max(150, self._zoom_pct), 1000, 0),
+                    ("Fit Width", 3, 0, 0),
+                    ("Fit Height", 4, 0, 0),
+                    ("1:1 Native", 200, 0, 0),
+                    ("Edge Top", 3, 0, -1000),
+                    ("Edge Bottom", 3, 0, 1000),
+                    ("Edge Left", 4, -1000, 0),
+                    ("Edge Right", 4, 1000, 0),
                 )
                 self._preset_idx = (self._preset_idx + 1) % len(presets)
                 lbl, zp, px, py = presets[self._preset_idx]
@@ -364,8 +409,9 @@ class CartridgeHostApp(BaseApp):
                 return
             if action in ('DOWN', 'REPEAT'):
                 if key in ('A', 'B'):
+                    base_z = 100 if self._zoom_pct == 3 else (53 if self._zoom_pct == 4 else self._zoom_pct)
                     delta = 10 if key == 'A' else -10
-                    self._zoom_pct = max(50, min(250, self._zoom_pct + delta))
+                    self._zoom_pct = max(50, min(250, base_z + delta))
                     self._sync_shm_control()
                     if hasattr(self.ui, 'show_toast'):
                         self.ui.show_toast(f"Zoom: {self._zoom_pct}%", duration=0.8)

@@ -1170,56 +1170,27 @@ class Display:
                     self._hybrid_dither_hold_until = now_h + 1.0
                     self._hybrid_in_dither = True
                     in_dither = True
+                if not in_dither:
+                    total_pwm_b = 0
+                    for p in range(8):
+                        x_b = (int.from_bytes(c_hi[p][1], "little") ^ int.from_bytes(c_lo[p][1], "little")).to_bytes(128, "little")
+                        total_pwm_b += 128 - x_b.count(0)
+                    # Comment (invariant): Promote all 8 pages coherently to full-frame 8-bit dither whenever total_pwm_b exceeds pwm_budget so adjacent 8px strips never tear or flash between 3-phase PWM and 1-bit stipple during scaled/zoomed playback.
+                    if total_pwm_b > pwm_budget:
+                        in_dither = True
                 if in_dither:
                     src_l = gray_planes[3] if (len(gray_planes) >= 4 and gray_planes[3] is not None) else None
                     if src_l is not None:
                         if self.invert_mode:
                             src_l = ImageOps.invert(src_l)
-                        d_img = self._apply_dither_img(src_l)
+                        d_algo = getattr(self, "dither_algo", "bayer8")
+                        if getattr(self, "_gray_scaled_source", False) and d_algo in ("bayer8", "bayer4", "bayer2", "cluster"):
+                            d_algo = "ign"
+                        d_img = self._apply_dither_img(src_l, algo=d_algo)
                         c_hi = self._compile_page_buffers(d_img, getattr(self, "_ui_pages_hi", None))
                         self._ui_pages_hi = c_hi
                         c_ph1 = None
                         c_lo = None
-                else:
-                    p_costs = []
-                    total_pwm_b = 0
-                    for p in range(8):
-                        x_b = (int.from_bytes(c_hi[p][1], "little") ^ int.from_bytes(c_lo[p][1], "little")).to_bytes(128, "little")
-                        cost = 128 - x_b.count(0)
-                        if cost > 0:
-                            p_costs.append((cost, p))
-                            total_pwm_b += cost
-                    if total_pwm_b > pwm_budget:
-                        c_hi = list(c_hi)
-                        c_ph1 = list(c_ph1)
-                        c_lo = list(c_lo)
-                        src_l = gray_planes[3] if (len(gray_planes) >= 4 and gray_planes[3] is not None) else None
-                        if src_l is not None and self.invert_mode:
-                            src_l = ImageOps.invert(src_l)
-                        full_d_px = self._apply_dither_img(src_l).convert("L").tobytes() if src_l is not None else None
-                        p_costs.sort(reverse=True)
-                        for cost, p in p_costs:
-                            if total_pwm_b <= pwm_budget:
-                                break
-                            y0 = p * 8
-                            if full_d_px is not None:
-                                d_px = full_d_px[y0 * 128 : (y0 + 8) * 128]
-                            else:
-                                box = (0, y0, 128, y0 + 8)
-                                b0 = hi_img.crop(box).convert("L").tobytes()
-                                b1 = i_ph1.crop(box).convert("L").tobytes()
-                                b2 = i_lo.crop(box).convert("L").tobytes()
-                                strip_l = Image.frombytes("L", (128, 8), bytes((a + b + c) // 3 for a, b, c in zip(b0, b1, b2)))
-                                d_px = self._apply_dither_img(strip_l).convert("L").tobytes()
-                            pg_b = bytes(
-                                (1 if d_px[x] else 0) | (2 if d_px[128 + x] else 0) | (4 if d_px[256 + x] else 0) | (8 if d_px[384 + x] else 0)
-                                | (16 if d_px[512 + x] else 0) | (32 if d_px[640 + x] else 0) | (64 if d_px[768 + x] else 0) | (128 if d_px[896 + x] else 0)
-                                for x in range(128)
-                            )
-                            c_hi[p] = (True, pg_b)
-                            c_ph1[p] = (True, pg_b)
-                            c_lo[p] = (True, pg_b)
-                            total_pwm_b -= cost
 
         shm = getattr(self, "_shm", None)
         if shm is not None:
@@ -1620,13 +1591,14 @@ class Display:
                 for x in range(x1, x2 + 1):
                     px[x, y] = 1 if ((x + y + parity) & 1) == 0 else 0
 
-    def draw_gray_frame(self, x0: int, y0: int, w: int, h: int, gray_bytes: bytes, mode_override: str = None):
+    def draw_gray_frame(self, x0: int, y0: int, w: int, h: int, gray_bytes: bytes, mode_override: str = None, scaled_source: bool = False):
         # Universal 8-Bit Grayscale Engine (supports gray_mode: 'hybrid' [default], 'pwm', 'dithering')
         if not self.device or not self.draw:
             return
         g_img = Image.frombytes("L", (w, h), gray_bytes)
         gm = mode_override if mode_override in ("hybrid", "pwm", "dithering", "off") else getattr(self, "gray_mode", "hybrid")
         self._gray_force_pwm = (gm == "pwm")
+        self._gray_scaled_source = bool(scaled_source)
         if gm == "off":
             bw_lut = getattr(self, "_bw_thresh_lut", None)
             if bw_lut is None:
@@ -1637,7 +1609,11 @@ class Display:
             self.has_active_marquee = True
             return
         if gm == "dithering":
-            self.image.paste(self._apply_dither_img(g_img), (x0, y0))
+            # Comment (quality): Periodic Bayer grids beat against resampled source pixel lattices on zoomed/scaled frames (row_sd=0.135); substitute aperiodic IGN automatically unless an error-diffusion/blue-noise kernel is selected.
+            d_algo = getattr(self, "dither_algo", "bayer8")
+            if scaled_source and d_algo in ("bayer8", "bayer4", "bayer2", "cluster"):
+                d_algo = "ign"
+            self.image.paste(self._apply_dither_img(g_img, algo=d_algo), (x0, y0))
             self._pwm_gray_planes = None
             self.has_active_marquee = True
             return

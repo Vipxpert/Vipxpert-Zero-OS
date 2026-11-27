@@ -183,18 +183,25 @@ unsafe extern "C" fn cb_video_refresh(data: *const c_void, width: u32, height: u
             }
         }
         3 => {
-            // Custom Zoom & Pan: zoom_pct (50..300, 100=Fill width), pan_x/pan_y (-1000..1000, 0=Center, +/-1000=Edges)
-            let zoom = state.zoom_pct.load(Ordering::Relaxed).clamp(50, 300) as f32;
+            // Custom Zoom & Pan: zoom_pct (3=Fit Width, 4=Fit Height, else % clamped >= min_fit), pan_x/pan_y (-1000..1000, 0=Center, +/-1000=Edges)
+            let raw_zoom = state.zoom_pct.load(Ordering::Relaxed);
             let pan_x = state.pan_x.load(Ordering::Relaxed).clamp(-1000, 1000) as f32 / 1000.0;
             let pan_y = state.pan_y.load(Ordering::Relaxed).clamp(-1000, 1000) as f32 / 1000.0;
             let wf = w as f32;
             let hf = h as f32;
+            let fit_w = 100.0f32;
+            let fit_h = 100.0f32 * (wf / hf) / ((OLED_W as f32) / (OLED_H as f32));
+            let min_fit = fit_w.min(fit_h);
+            let zoom = match raw_zoom {
+                3 => fit_w,
+                4 => fit_h,
+                z => (z.clamp(10, 400) as f32).max(min_fit),
+            };
             let vw = wf * 100.0 / zoom;
             let vh = vw * (OLED_H as f32) / (OLED_W as f32);
-            let max_ox = ((wf - vw) * 0.5).max(0.0);
-            let max_oy = ((hf - vh) * 0.5).max(0.0);
-            let cx = wf * 0.5 + pan_x * max_ox;
-            let cy = hf * 0.5 + pan_y * max_oy;
+            // Unified edge-snap offset: snaps cleanly to OLED edges for both cropped (vw <= wf) and pillarboxed (vw > wf) frames.
+            let cx = wf * 0.5 + pan_x * ((wf - vw) * 0.5);
+            let cy = hf * 0.5 + pan_y * ((hf - vh) * 0.5);
             let x0 = cx - vw * 0.5;
             let y0 = cy - vh * 0.5;
             // Comment (quality): Use exact fractional area-weighted box resampling when downscaling (step > 1.0) so 1px/2px NES checkerboard/dither tiles average into steady gray instead of aliasing into scrolling black/white moire bands; use bilinear only when magnifying.

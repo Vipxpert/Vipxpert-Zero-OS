@@ -1314,6 +1314,8 @@ class UIManager:
             band = self.display.image.crop((0, yb0, 128, 64))
             gp[0].paste(band, (0, yb0))
             gp[1].paste(band, (0, yb0))
+            if len(gp) >= 4 and gp[3] is not None:
+                gp[3].paste(band.convert("L"), (0, yb0))
 
     def is_minimal_ui(self) -> bool:
         """Master Minimal Mode flag: when enabled, disables all transitions, smooth scrolling, styled App Launcher, and Modern Recent cards."""
